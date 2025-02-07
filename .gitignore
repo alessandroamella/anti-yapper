@@ -1,0 +1,5 @@
+.env
+*.ogg
+*.mp3
+*.wav
+*.txt
