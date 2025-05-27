@@ -1,0 +1,10 @@
+[Desktop Entry]
+# Change with your actual values!
+Name=Anti-yapper AI Audio Summarizer
+Comment=Transcribe and summarize audio with Whisper and Gemini
+Exec=/home/bitrey/.pyenv/shims/python3 /home/bitrey/Documents/webdev_projects/riassunto-audio/gui.py
+Icon=/home/bitrey/Pictures/favicon.png
+Terminal=false
+Type=Application
+Categories=AudioVideo;Utility;AI;
+StartupNotify=true
