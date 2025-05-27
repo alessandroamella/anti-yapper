@@ -11,13 +11,11 @@ Programma GUI per trascrivere e riassumere file audio. Così puoi avere lezioni 
 - **Modalità Solo Trascrizione:** Ottieni solo la trascrizione, senza riassunto.
 - **Prompt Personalizzabile:** Definisci il tuo prompt per Gemini e personalizza lo stile del riassunto.
 - **GUI:** Interfaccia semplice creata con PyQt5.
-- **Tema Scuro:**.
+- **Tema Scuro:** Sì.
 - **Salvataggio Output:** Salvataggio automatico del riassunto (o trascrizione) in formato Markdown (`.md`).
 - **Formati Supportati:** Compatibile con OGG, WAV, MP3 e FLAC.
 
 ## 🚀 Installazione
-
-Segui questi passaggi per avviare Anti-Yapper sulla tua macchina.
 
 ### Prerequisiti
 
