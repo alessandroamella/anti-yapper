@@ -285,6 +285,8 @@ class SummarizationThread(QThread):
 
 
 class AudioSummaryApp(QWidget):
+    DEFAULT_PROMPT = "Riassumi la trascrizione di un messaggio vocale ricevuto dall'utilizzatore del softwarede. Deve essere un riassunto in terza persona rispetto all'interlocutore. Fai sì che sia comprensibile la comprensione del 'mood' del messaggio, in modo che il lettore possa comprendere il tono e il contenuto di esso, oltre allo stato emotivo dell'interlocutore. Di seguito la trascrizione:"
+
     def __init__(self):
         logging.info("AudioSummaryApp initialization started.")
         super().__init__()
@@ -435,15 +437,13 @@ class AudioSummaryApp(QWidget):
         self.layout.addWidget(self.prompt_label)
         self.prompt_text_edit = QTextEdit(self)
         self.prompt_text_edit.setFixedHeight(180)  # Adjust height as needed
-        self.prompt_text_edit.setPlainText(
-            "Fai un riassunto del seguente messaggio vocale:"
-        )  # Default prompt
+        self.prompt_text_edit.setPlainText(self.DEFAULT_PROMPT)  # Default prompt
         self.prompt_text_edit.textChanged.connect(
             self.save_settings
         )  # Save setting on change
         self.layout.addWidget(self.prompt_text_edit)
 
-        self.process_button = QPushButton("Vamos!!", self)
+        self.process_button = QPushButton("Riassumi!!", self)
         self.process_button.clicked.connect(self.start_processing)
         self.process_button.setEnabled(False)
         self.layout.addWidget(self.process_button)
@@ -486,9 +486,7 @@ class AudioSummaryApp(QWidget):
 
     def load_settings(self):
         logging.info("Loading settings from QSettings.")
-        saved_prompt = self.settings.value(
-            "promptText", "Fai un riassunto del seguente messaggio vocale:"
-        )
+        saved_prompt = self.settings.value("promptText", self.DEFAULT_PROMPT)
         saved_checkbox_checked = self.settings.value(
             "mergeAudioChecked", True, type=bool
         )
@@ -514,8 +512,7 @@ class AudioSummaryApp(QWidget):
 
     def reset_prompt(self):
         logging.info("Resetting prompt and checkbox to default.")
-        default_prompt = "Fai un riassunto del seguente messaggio vocale:"
-        self.prompt_text_edit.setPlainText(default_prompt)
+        self.prompt_text_edit.setPlainText(self.DEFAULT_PROMPT)
         self.merge_audio_checkbox.setChecked(True)
         self.transcription_only_checkbox.setChecked(False)  # Default to unchecked
         self.save_settings()  # Save default settings
@@ -665,7 +662,10 @@ class AudioSummaryApp(QWidget):
 
         # Get the last save directory from settings, or use the current directory as default
         last_save_directory = self.settings.value("lastSaveDirectory", "")
-        default_file_name = os.path.join(last_save_directory, "summary.md")
+        default_file_name = os.path.join(
+            last_save_directory,
+            "summary.md" if self.summary_markdown_text else "transcription.txt"
+        ) # Default file name based on summary or transcription
 
         file_path, _ = file_dialog.getSaveFileName(
             self,
@@ -682,7 +682,11 @@ class AudioSummaryApp(QWidget):
 
             try:
                 with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(self.summary_markdown_text)
+                    # write markdown text if summary, else write transcription
+                    if self.summary_markdown_text:
+                        f.write(self.summary_markdown_text)
+                    else:
+                        f.write(self.transcription_output_text_edit.toPlainText())
                 logging.info("Summary saved successfully.")
                 self.status_label.setText(f"Riassunto salvato in: {file_path}")
             except Exception as e:
