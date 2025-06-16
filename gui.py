@@ -230,7 +230,7 @@ class SummarizationThread(QThread):
 
                 logging.info("Starting summarization with Gemini.")
                 model = self.gemini_client.models.generate_content(
-                    model="gemini-2.0-flash",
+                    model="gemini-2.5-flash-preview-05-20",
                     # Use user defined prompt
                     contents=f"{self.summarization_prompt} {transcription_text_for_summary}",
                 )
@@ -664,8 +664,8 @@ class AudioSummaryApp(QWidget):
         last_save_directory = self.settings.value("lastSaveDirectory", "")
         default_file_name = os.path.join(
             last_save_directory,
-            "summary.md" if self.summary_markdown_text else "transcription.txt"
-        ) # Default file name based on summary or transcription
+            "summary.md" if self.summary_markdown_text else "transcription.txt",
+        )  # Default file name based on summary or transcription
 
         file_path, _ = file_dialog.getSaveFileName(
             self,
