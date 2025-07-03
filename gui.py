@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 from google import genai
 from openai import OpenAI
 from pydub import AudioSegment
-from PyQt5.QtCore import QSettings, QThread, pyqtSignal  # Import QSettings
-from PyQt5.QtWidgets import (  # Import QCheckBox
+from PyQt6.QtCore import QSettings, QThread, pyqtSignal  # Import QSettings
+from PyQt6.QtWidgets import (  # Import QCheckBox
     QApplication,
     QCheckBox,
     QFileDialog,
@@ -740,6 +740,6 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     main_window = AudioSummaryApp()
     main_window.show()
-    exit_code = app.exec_()
+    exit_code = app.exec()
     logging.info(f"Application exited with code: {exit_code}")
     sys.exit(exit_code)
