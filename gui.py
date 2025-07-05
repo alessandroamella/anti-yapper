@@ -285,7 +285,7 @@ class SummarizationThread(QThread):
 
 
 class AudioSummaryApp(QWidget):
-    DEFAULT_PROMPT = "Riassumi la trascrizione di un messaggio vocale ricevuto dall'utilizzatore del softwarede. Deve essere un riassunto in terza persona rispetto all'interlocutore. Fai sì che sia comprensibile la comprensione del 'mood' del messaggio, in modo che il lettore possa comprendere il tono e il contenuto di esso, oltre allo stato emotivo dell'interlocutore. Di seguito la trascrizione:"
+    DEFAULT_PROMPT = "Riassumi la trascrizione di un messaggio vocale ricevuto dall'utente."
 
     def __init__(self):
         logging.info("AudioSummaryApp initialization started.")
