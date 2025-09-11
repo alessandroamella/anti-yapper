@@ -3,3 +3,4 @@
 *.mp3
 *.wav
 transcription*.txt
+__pycache__/

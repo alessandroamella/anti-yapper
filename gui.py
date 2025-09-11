@@ -11,6 +11,7 @@ from google import genai
 from openai import OpenAI
 from pydub import AudioSegment
 from PyQt6.QtCore import QSettings, QThread, pyqtSignal  # Import QSettings
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (  # Import QCheckBox
     QApplication,
     QCheckBox,
@@ -285,7 +286,9 @@ class SummarizationThread(QThread):
 
 
 class AudioSummaryApp(QWidget):
-    DEFAULT_PROMPT = "Riassumi la trascrizione di un messaggio vocale ricevuto dall'utente."
+    DEFAULT_PROMPT = (
+        "Riassumi la trascrizione di un messaggio vocale ricevuto dall'utente."
+    )
 
     def __init__(self):
         logging.info("AudioSummaryApp initialization started.")
@@ -299,6 +302,7 @@ class AudioSummaryApp(QWidget):
         self.summarization_thread = None
         self.audio_file_paths = []  # To store multiple file paths
         self.summary_markdown_text = ""  # To store summary in markdown format
+        self.summary_is_unsaved = False  # Track if summary exists but is unsaved
         self.settings = QSettings(
             "BitreyDev", "AudioSummaryApp"
         )  # Initialize QSettings
@@ -471,6 +475,11 @@ class AudioSummaryApp(QWidget):
         self.layout.addWidget(self.status_label)
 
         self.setLayout(self.layout)
+
+        # Add Ctrl+S shortcut for saving unsaved summaries
+        save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        save_shortcut.activated.connect(self.handle_save_shortcut)
+
         logging.info("User interface initialized.")
 
         self.update_prompt_textbox_state()  # Set initial state of prompt textbox
@@ -570,6 +579,7 @@ class AudioSummaryApp(QWidget):
 
     def start_processing(self):
         logging.info("Start processing button clicked.")
+        self.summary_is_unsaved = False  # Reset flag when starting new processing
         if not self.audio_file_paths:  # Check if file paths list is empty
             warning_msg_no_file = "No audio file selected before processing."
             logging.warning(warning_msg_no_file)
@@ -652,6 +662,7 @@ class AudioSummaryApp(QWidget):
         self.prompt_text_edit.setEnabled(True)
         self.progress_bar.setValue(100)
         self.summary_markdown_text = summary_text  # Store markdown text
+        self.summary_is_unsaved = True  # Set flag to indicate unsaved summary
 
         self.prompt_save_file()  # Call save file dialog after displaying result
         logging.info("Summary displayed and UI updated.")
@@ -689,6 +700,7 @@ class AudioSummaryApp(QWidget):
                         f.write(self.transcription_output_text_edit.toPlainText())
                 logging.info("Summary saved successfully.")
                 self.status_label.setText(f"Riassunto salvato in: {file_path}")
+                self.summary_is_unsaved = False  # Reset flag upon successful save
             except Exception as e:
                 error_msg = f"Errore durante il salvataggio del file: {e}"
                 logging.error(error_msg)
@@ -698,7 +710,20 @@ class AudioSummaryApp(QWidget):
                 )
         else:
             logging.info("Save file dialog cancelled by user.")
-            self.status_label.setText("Riassunto non salvato.")
+            self.status_label.setText(
+                "Riassunto markdown non salvato - puoi premere Ctrl+S per salvare."
+            )
+
+    def handle_save_shortcut(self):
+        """
+        Handles the Ctrl+S shortcut. If a summary exists and is unsaved,
+        it re-triggers the save file dialog.
+        """
+        if self.summary_is_unsaved and self.summary_markdown_text:
+            logging.info("Ctrl+S shortcut activated for unsaved summary.")
+            self.prompt_save_file()
+        else:
+            logging.info("Ctrl+S shortcut ignored: no unsaved summary available.")
 
     def display_transcription(self, transcription_text):
         logging.info("Displaying transcription.")
