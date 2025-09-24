@@ -38,8 +38,7 @@ class SummarizationThread(QThread):
     support for large and multiple audio files.
     """
 
-    summary_finished = pyqtSignal(str)
-    transcription_finished = pyqtSignal(str)
+    processing_finished = pyqtSignal(str, bool)  # Emits: (result_text, is_summary)
     error_occurred = pyqtSignal(str, str)
     progress_update = pyqtSignal(int)
 
@@ -105,24 +104,91 @@ class SummarizationThread(QThread):
                 uploaded_gemini_files.append(gemini_file)  # Track for cleanup
                 logging.info(f"Successfully uploaded {gemini_file.name}")
 
-            logging.info("All files uploaded. Requesting transcription from Gemini...")
+            logging.info("All files uploaded.")
             self.progress_update.emit(70)
 
-            # Make a single API call to get the transcription for all audio files
-            transcription_response = self.gemini_client.models.generate_content(
-                model="gemini-2.5-flash",  # Use a model that supports audio
-                contents=gemini_contents,
-            )
-            full_transcription_text = transcription_response.text
-            self.transcription_finished.emit(full_transcription_text)
+            # --- NEW LOGIC: Conditional API Call ---
+            if self.transcription_only:
+                # --- SCENARIO 1: TRANSCRIPTION ONLY (Existing Logic) ---
+                logging.info("Requesting transcription from Gemini...")
 
-            logging.info("All transcription tasks finished.")
-            logging.info(
-                f"Full transcription (first 100 chars): {full_transcription_text[:100]}..."
-            )
-            self.progress_update.emit(80)
+                # Build contents for transcription
+                gemini_contents.append(self.transcription_prompt)
 
-            # --- Save transcription to temp file ---
+                transcription_response = self.gemini_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=gemini_contents,
+                )
+                full_transcription_text = transcription_response.text
+
+                # Emit the new single signal with is_summary=False for transcription only
+                self.processing_finished.emit(full_transcription_text, False)
+                logging.info("Transcription-only result sent to UI.")
+
+            else:
+                # --- SCENARIO 2: TRANSCRIPTION AND SUMMARY (New Single-Call Logic) ---
+                logging.info(
+                    "Requesting transcription AND summary from Gemini in a single call..."
+                )
+
+                # Build contents for the combined task. The summarization_prompt is now the main prompt.
+                gemini_contents.append(self.summarization_prompt)
+
+                combined_response = self.gemini_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=gemini_contents,
+                )
+                combined_text = combined_response.text
+
+                # --- PARSE THE RESPONSE ---
+                # We expect the model to follow the prompt's structure.
+                # Let's use robust splitting to separate the two parts.
+                full_transcription_text = ""
+                summary_text = ""
+
+                # Use unique markers that we will define in the new default prompt.
+                transcription_marker = "**Trascrizione:**"
+                summary_marker = "**Riassunto:**"
+
+                if summary_marker in combined_text:
+                    parts = combined_text.split(summary_marker, 1)
+                    if transcription_marker in parts[0]:
+                        # Extract transcription from the first part
+                        full_transcription_text = (
+                            parts[0].replace(transcription_marker, "").strip()
+                        )
+                    else:
+                        # If the transcription marker is missing, assume the first part is the transcription
+                        full_transcription_text = parts[0].strip()
+                    summary_text = parts[1].strip()
+                else:
+                    # Fallback if the model doesn't follow instructions perfectly
+                    logging.warning(
+                        "Summary marker not found in response. Treating the whole response as the summary."
+                    )
+                    summary_text = combined_text
+                    # We can't reliably extract the transcription in this case
+                    full_transcription_text = "Could not be separated from the summary."
+
+                logging.info("Transcription and summary received and parsed.")
+
+                # Create a single, combined markdown string for output
+                combined_markdown_output = (
+                    f"## Riassunto\n\n{summary_text}\n\n"
+                    f"---\n\n"
+                    f"## Trascrizione\n\n{full_transcription_text}"
+                )
+
+                # Emit the new single signal with is_summary=True for combined content
+                self.processing_finished.emit(combined_markdown_output, True)
+                logging.info("Combined summary and transcription result sent to UI.")
+
+                # Also update the variable used for saving
+                self.final_summary_markdown = combined_markdown_output
+
+            self.progress_update.emit(95)  # A bit of progress left for cleanup
+
+            # --- Save transcription to temp file (Optional but can be useful) ---
             try:
                 with tempfile.NamedTemporaryFile(
                     suffix=".txt", mode="w", delete=False, encoding="utf-8"
@@ -133,27 +199,6 @@ class SummarizationThread(QThread):
                     )
             except Exception as e:
                 logging.error(f"Error saving transcription to temporary file: {e}")
-
-            # --- Summarization (if not transcription_only) ---
-            if not self.transcription_only:
-                logging.info("Starting summarization with Gemini.")
-                response = self.gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=f"{self.summarization_prompt}\n\n{full_transcription_text}",
-                )
-                summary_text = response.text
-                logging.info("Summarization finished.")
-                logging.info(f"Summary (first 50 chars): {summary_text[:50]}...")
-                self.progress_update.emit(90)
-                self.final_summary_markdown = summary_text
-                self.summary_finished.emit(summary_text)
-            else:
-                final_summary_output = (
-                    "Transcription completed - summarization skipped as requested."
-                )
-                self.final_summary_markdown = ""  # No summary to save
-                self.summary_finished.emit(final_summary_output)
-                logging.info("Summarization skipped due to 'Transcription Only' mode.")
 
             self.progress_update.emit(100)
             logging.info("Summarization thread finished successfully.")
@@ -184,9 +229,7 @@ class SummarizationThread(QThread):
 
 
 class AudioSummaryApp(QWidget):
-    DEFAULT_PROMPT = (
-        "Riassumi la trascrizione di un messaggio vocale ricevuto dall'utente."
-    )
+    DEFAULT_PROMPT = "Riassumi il contenuto dei file audio forniti."
     DEFAULT_TRANSCRIPTION_PROMPT = "Genera una trascrizione dei file audio forniti."
 
     def __init__(self):
@@ -201,6 +244,7 @@ class AudioSummaryApp(QWidget):
         self.audio_file_paths = []
         self.summary_markdown_text = ""
         self.summary_is_unsaved = False
+        self.last_result_is_summary = False
         self.settings = QSettings("BitreyDev", "AudioSummaryApp")
 
         self.init_ui()
@@ -230,13 +274,26 @@ class AudioSummaryApp(QWidget):
             QPushButton:pressed {
                 background-color: #444444;
             }
+            QPushButton:disabled {
+                background-color: #3a3a3a;
+                color: #666666;
+                border: 1px solid #444444;
+            }
             QLabel {
                 color: #ffffff;
+            }
+            QLabel:disabled {
+                color: #888888;
             }
             QTextEdit {
                 background-color: #444444;
                 color: #ffffff;
                 border: 1px solid #666666;
+            }
+            QTextEdit:disabled {
+                background-color: #2a2a2a;
+                color: #666666;
+                border: 1px solid #444444;
             }
             QProgressBar {
                 background-color: #444444;
@@ -249,6 +306,13 @@ class AudioSummaryApp(QWidget):
             }
             QCheckBox {
                 color: #ffffff;
+            }
+            QCheckBox:disabled {
+                color: #666666;
+            }
+            QCheckBox::indicator:disabled {
+                background-color: #2a2a2a;
+                border: 1px solid #444444;
             }
         """
         )
@@ -301,9 +365,7 @@ class AudioSummaryApp(QWidget):
         self.layout.addWidget(self.transcription_prompt_label)
         self.transcription_prompt_text_edit = QTextEdit(self)
         self.transcription_prompt_text_edit.setFixedHeight(100)
-        self.transcription_prompt_text_edit.setPlainText(
-            self.DEFAULT_TRANSCRIPTION_PROMPT
-        )
+        # Don't set default text here - let load_settings() handle it
         self.transcription_prompt_text_edit.textChanged.connect(self.save_settings)
         self.layout.addWidget(self.transcription_prompt_text_edit)
 
@@ -312,7 +374,7 @@ class AudioSummaryApp(QWidget):
         self.layout.addWidget(self.prompt_label)
         self.prompt_text_edit = QTextEdit(self)
         self.prompt_text_edit.setFixedHeight(180)
-        self.prompt_text_edit.setPlainText(self.DEFAULT_PROMPT)
+        # Don't set default text here - let load_settings() handle it
         self.prompt_text_edit.textChanged.connect(self.save_settings)
         self.layout.addWidget(self.prompt_text_edit)
 
@@ -327,15 +389,10 @@ class AudioSummaryApp(QWidget):
         self.progress_bar.setValue(0)
         self.layout.addWidget(self.progress_bar)
 
-        self.layout.addWidget(QLabel("Trascrizione:"))
-        self.transcription_output_text_edit = QTextEdit(self)
-        self.transcription_output_text_edit.setReadOnly(True)
-        self.layout.addWidget(self.transcription_output_text_edit)
-
-        self.layout.addWidget(QLabel("Riassunto:"))
-        self.summary_output_text_edit = QTextEdit(self)
-        self.summary_output_text_edit.setReadOnly(True)
-        self.layout.addWidget(self.summary_output_text_edit)
+        self.layout.addWidget(QLabel("Risultato:"))
+        self.output_text_edit = QTextEdit(self)
+        self.output_text_edit.setReadOnly(True)
+        self.layout.addWidget(self.output_text_edit)
 
         self.status_label = QLabel("", self)
         self.layout.addWidget(self.status_label)
@@ -351,23 +408,40 @@ class AudioSummaryApp(QWidget):
 
     def update_prompt_textbox_state(self):
         is_transcription_only = self.transcription_only_checkbox.isChecked()
+
+        # Summary prompt is enabled ONLY if transcription_only is FALSE
         self.prompt_text_edit.setEnabled(not is_transcription_only)
         self.prompt_label.setEnabled(not is_transcription_only)
 
+        # NEW: Transcription prompt is enabled ONLY if transcription_only is TRUE
+        self.transcription_prompt_text_edit.setEnabled(is_transcription_only)
+        self.transcription_prompt_label.setEnabled(is_transcription_only)
+
     def load_settings(self):
         logging.info("Loading settings from QSettings.")
+
+        # Temporarily disconnect textChanged signals to avoid triggering save_settings during load
+        self.transcription_prompt_text_edit.textChanged.disconnect()
+        self.prompt_text_edit.textChanged.disconnect()
+
         saved_transcription_prompt = self.settings.value(
             "transcriptionPromptText", self.DEFAULT_TRANSCRIPTION_PROMPT
         )
         self.transcription_prompt_text_edit.setPlainText(saved_transcription_prompt)
 
         saved_prompt = self.settings.value("promptText", self.DEFAULT_PROMPT)
+        self.prompt_text_edit.setPlainText(saved_prompt)
+
         saved_transcription_only_checked = self.settings.value(
             "transcriptionOnlyChecked", False, type=bool
         )
 
-        self.prompt_text_edit.setPlainText(saved_prompt)
         self.transcription_only_checkbox.setChecked(saved_transcription_only_checked)
+
+        # Reconnect the textChanged signals
+        self.transcription_prompt_text_edit.textChanged.connect(self.save_settings)
+        self.prompt_text_edit.textChanged.connect(self.save_settings)
+
         logging.info("Settings loaded.")
 
     def save_settings(self):
@@ -424,8 +498,7 @@ class AudioSummaryApp(QWidget):
 
             self.file_path_label.setText(display_text)
             self.process_button.setEnabled(True)
-            self.summary_output_text_edit.clear()
-            self.transcription_output_text_edit.clear()
+            self.output_text_edit.clear()
             self.status_label.clear()
         else:
             self.file_path_label.setText("Nessun file audio selezionato")
@@ -454,8 +527,7 @@ class AudioSummaryApp(QWidget):
         self.process_button.setEnabled(False)
         self.update_prompt_textbox_state()  # Ensure prompt is disabled if needed
         self.progress_bar.setValue(0)
-        self.summary_output_text_edit.clear()
-        self.transcription_output_text_edit.clear()
+        self.output_text_edit.clear()
 
         transcription_only = self.transcription_only_checkbox.isChecked()
         summarization_prompt = (
@@ -471,40 +543,46 @@ class AudioSummaryApp(QWidget):
             transcription_prompt,
             transcription_only,
         )
-        self.summarization_thread.summary_finished.connect(self.display_result)
-        self.summarization_thread.transcription_finished.connect(
-            self.display_transcription
-        )
+        self.summarization_thread.processing_finished.connect(self.display_result)
         self.summarization_thread.error_occurred.connect(self.display_error)
         self.summarization_thread.progress_update.connect(self.update_progress)
         self.summarization_thread.start()
         logging.info("Summarization thread started.")
 
-    def display_result(self, summary_text):
-        logging.info("Displaying summary result.")
-        html_summary = mistune.html(summary_text)
-        self.summary_output_text_edit.setHtml(html_summary)
+    def display_result(self, result_text, is_summary):
+        logging.info(f"Displaying result. Is summary: {is_summary}")
+
+        if is_summary:
+            # If it's a summary, it contains Markdown. Render it as HTML.
+            html_content = mistune.html(result_text)
+            self.output_text_edit.setHtml(html_content)
+        else:
+            # Otherwise, it's a plain text transcription.
+            self.output_text_edit.setPlainText(result_text)
+
         self.status_label.setText("Finito!!")
         self.process_button.setEnabled(True)
         self.update_prompt_textbox_state()
         self.progress_bar.setValue(100)
-        self.summary_markdown_text = summary_text
-        self.summary_is_unsaved = bool(summary_text)
+
+        # This variable is used for saving the file later
+        self.last_result_is_summary = is_summary
+        self.summary_markdown_text = result_text
+        self.summary_is_unsaved = bool(result_text)
+
         self.prompt_save_file()
-        logging.info("Summary displayed and UI updated.")
+        logging.info("Result displayed and UI updated.")
 
     def prompt_save_file(self):
-        is_summary = bool(
-            self.summary_markdown_text
-            and "Transcription completed" not in self.summary_markdown_text
-        )
-        if is_summary:
+        # The new flag makes this logic cleaner and more reliable.
+        if self.last_result_is_summary:
             content_to_save = self.summary_markdown_text
             default_suffix = "summary.md"
             file_filter = "Markdown Files (*.md)"
-            dialog_title = "Salva riassunto come Markdown"
+            dialog_title = "Salva riassunto e trascrizione come Markdown"
         else:
-            content_to_save = self.transcription_output_text_edit.toPlainText()
+            # This handles the transcription-only case
+            content_to_save = self.output_text_edit.toPlainText()
             default_suffix = "transcription.txt"
             file_filter = "Text Files (*.txt)"
             dialog_title = "Salva trascrizione come testo"
@@ -541,11 +619,6 @@ class AudioSummaryApp(QWidget):
     def handle_save_shortcut(self):
         if self.summary_is_unsaved:
             self.prompt_save_file()
-
-    def display_transcription(self, transcription_text):
-        logging.info("Displaying full transcription.")
-        # Since we get the full text at once, we just set it.
-        self.transcription_output_text_edit.setPlainText(transcription_text)
 
     def display_error(self, error_message, file_path):
         logging.error(f"Error occurred: {error_message} for file: {file_path}")
