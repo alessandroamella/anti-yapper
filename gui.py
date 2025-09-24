@@ -4,6 +4,7 @@ import logging  # Import the logging module
 import os
 import sys
 import tempfile
+import math
 
 import mistune
 from dotenv import load_dotenv
@@ -31,13 +32,16 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Define the Whisper API file size limit (25MB). We use 24MB to be safe.
+WHISPER_API_LIMIT_BYTES = 24 * 1024 * 1024
+
 
 class SummarizationThread(QThread):
     """
     Thread to handle audio processing, transcription (OpenAI Whisper),
     and summarization (Gemini) to avoid blocking the GUI.
     Handles single or merged audio files based on 'merge_audio' flag.
-    Optimized for smaller merged audio file size.
+    Splits files larger than 25MB and handles multiple files intelligently based on size.
     """
 
     summary_finished = pyqtSignal(str)
@@ -55,232 +59,213 @@ class SummarizationThread(QThread):
         transcription_only=False,
     ):
         super().__init__()
-        self.audio_file_paths = audio_file_paths  # Now accepts a list of file paths
+        self.audio_file_paths = audio_file_paths
         self.openai_api_key = openai_api_key
         self.gemini_api_key = gemini_api_key
-        self.summarization_prompt = summarization_prompt  # User defined prompt
-        self.merge_audio = merge_audio  # Flag to control audio merging
-        self.transcription_only = transcription_only  # Flag for transcription only mode
+        self.summarization_prompt = summarization_prompt
+        self.merge_audio = merge_audio
+        self.transcription_only = transcription_only
         self.openai_client = None
         self.gemini_client = None
-        self.temp_merged_file = None  # To store temp file object
-        self.final_summary_markdown = ""  # Store markdown summary
-        self.temp_transcription_file = None  # To store temp transcription file
+        self.temp_files_to_clean = []  # Store all temp file objects for cleanup
+        self.final_summary_markdown = ""
+        self.temp_transcription_file = None
 
     def run(self):
         logging.info(
-            f"Summarization thread started. Merge audio: {self.merge_audio}, Transcription Only: {self.transcription_only}"
+            f"Summarization thread started. Merge audio flag: {self.merge_audio}, Transcription Only: {self.transcription_only}"
         )
-        # Default value in case of early errors
-        file_name_for_error = "unknown audio file"
-        final_summary_output = ""  # To accumulate summaries if not merging
-        full_transcription_text = (
-            ""  # Accumulate transcription text for saving and display
-        )
+        file_name_for_error = "audio files"
+        full_transcription_text = ""
 
         try:
+            # --- API Key and Client Initialization ---
             if not self.openai_api_key:
-                error_msg = "OPENAI_API_KEY is not set in the .env file"
-                logging.error(error_msg)
-                raise ValueError(error_msg)
-            if (
-                not self.gemini_api_key and not self.transcription_only
-            ):  # Gemini key is needed only if not transcription_only
-                error_msg = "GEMINI_API_KEY is not set in the .env file"
-                logging.error(error_msg)
-                raise ValueError(error_msg)
+                raise ValueError("OPENAI_API_KEY is not set in the .env file")
+            if not self.gemini_api_key and not self.transcription_only:
+                raise ValueError("GEMINI_API_KEY is not set in the .env file")
 
             self.openai_client = OpenAI(api_key=self.openai_api_key)
             if not self.transcription_only:
                 self.gemini_client = genai.Client(api_key=self.gemini_api_key)
                 logging.info("Gemini client initialized.")
             logging.info("OpenAI client initialized.")
-
             self.progress_update.emit(10)
 
-            if self.merge_audio:
-                if (
-                    isinstance(self.audio_file_paths, list)
-                    and len(self.audio_file_paths) > 1
-                ):
-                    logging.info("Merging multiple audio files.")
+            # --- File Processing Logic based on Size ---
+            files_to_process = []
+
+            # Case 1: Single file selected
+            if len(self.audio_file_paths) == 1:
+                file_path = self.audio_file_paths[0]
+                file_size = os.path.getsize(file_path)
+
+                if file_size < WHISPER_API_LIMIT_BYTES:
+                    logging.info(
+                        f"Single file '{os.path.basename(file_path)}' is under the 25MB limit. Processing as is."
+                    )
+                    files_to_process.append(file_path)
+                else:
+                    logging.warning(
+                        f"File '{os.path.basename(file_path)}' is {file_size / (1024*1024):.2f}MB, which is over the 25MB limit. Splitting into chunks."
+                    )
+                    self.progress_update.emit(15)
+                    audio = AudioSegment.from_file(file_path)
+                    duration_ms = len(audio)
+                    # Calculate chunk duration to stay under the limit
+                    chunk_duration_ms = math.floor(
+                        (duration_ms * WHISPER_API_LIMIT_BYTES) / file_size
+                    )
+
+                    for i, start_ms in enumerate(
+                        range(0, duration_ms, chunk_duration_ms)
+                    ):
+                        end_ms = start_ms + chunk_duration_ms
+                        chunk = audio[start_ms:end_ms]
+
+                        temp_chunk_file = tempfile.NamedTemporaryFile(
+                            suffix=".mp3", delete=False
+                        )
+                        chunk.export(temp_chunk_file.name, format="mp3")
+                        files_to_process.append(temp_chunk_file.name)
+                        self.temp_files_to_clean.append(temp_chunk_file)
+                        logging.info(
+                            f"Created chunk {i+1} for transcription: {temp_chunk_file.name}. Length: {chunk.duration_seconds:.2f} Size: {os.path.getsize(temp_chunk_file.name) / (1024*1024):.2f}MB"
+                        )
+                    logging.info(f"Split file into {len(files_to_process)} chunks.")
+
+            # Case 2: Multiple files selected
+            elif len(self.audio_file_paths) > 1:
+                total_size = 0
+                for path in self.audio_file_paths:
+                    size = os.path.getsize(path)
+                    if size > WHISPER_API_LIMIT_BYTES:
+                        raise ValueError(
+                            f"File '{os.path.basename(path)}' is larger than 25MB. Processing multiple files where one is oversized is not supported."
+                        )
+                    total_size += size
+
+                if total_size < WHISPER_API_LIMIT_BYTES and self.merge_audio:
+                    logging.info(
+                        f"Total size of {len(self.audio_file_paths)} files is {total_size / (1024*1024):.2f}MB. Merging them."
+                    )
                     self.progress_update.emit(20)
                     merged_audio = AudioSegment.from_file(self.audio_file_paths[0])
                     for file_path in self.audio_file_paths[1:]:
-                        audio_segment = AudioSegment.from_file(file_path)
-                        merged_audio += audio_segment
+                        merged_audio += AudioSegment.from_file(file_path)
 
-                    # Strategy 1: Export merged audio as MP3 to reduce file size
-                    # MP3 is a lossy format but significantly smaller than WAV, suitable for voice.
-                    self.temp_merged_file = tempfile.NamedTemporaryFile(
+                    temp_merged_file = tempfile.NamedTemporaryFile(
                         suffix=".mp3", delete=False
-                    )  # Changed suffix to .mp3
-                    merged_audio.export(
-                        self.temp_merged_file.name,
-                        format="mp3",
-                        bitrate="128k",  # Strategy 2: Consider lower bitrate if needed, 128k is generally ok for speech
-                    )  # Export as MP3
-                    audio_file_to_process = open(self.temp_merged_file.name, "rb")
-                    file_name_for_error = "merged audio file"  # For error messages
-                    logging.info(
-                        f"Merged audio saved to temporary MP3 file: {self.temp_merged_file.name}"
                     )
-                    self.progress_update.emit(25)
-
+                    merged_audio.export(
+                        temp_merged_file.name, format="mp3", bitrate="128k"
+                    )
+                    files_to_process.append(temp_merged_file.name)
+                    self.temp_files_to_clean.append(temp_merged_file)
+                    logging.info(
+                        f"Merged audio saved to temporary file: {temp_merged_file.name}"
+                    )
                 else:
-                    # Process single audio file
-                    audio_file_path = (
-                        self.audio_file_paths
-                        if not isinstance(self.audio_file_paths, list)
-                        else self.audio_file_paths[0]
-                    )  # Handle single path or list with one path
-                    audio_file_to_process = open(audio_file_path, "rb")
-                    file_name_for_error = audio_file_path  # For error messages
-                    logging.info(f"Processing single audio file: {file_name_for_error}")
-                    self.progress_update.emit(30)
+                    if self.merge_audio:
+                        logging.warning(
+                            f"Total size of files is {total_size / (1024*1024):.2f}MB, which is over the 25MB limit. Processing files individually instead of merging."
+                        )
+                    else:
+                        logging.info(
+                            "Merge option is disabled. Processing files individually."
+                        )
+                    files_to_process = self.audio_file_paths
 
-                # Use the appropriate audio file (merged or single)
-                with audio_file_to_process:
-                    logging.info("Starting audio transcription with OpenAI Whisper.")
+            self.progress_update.emit(25)
+
+            # --- Unified Transcription Loop ---
+            combined_transcriptions = []
+            num_files = len(files_to_process)
+            for index, audio_file_path in enumerate(files_to_process):
+                file_name_for_error = os.path.basename(audio_file_path)
+                logging.info(
+                    f"Processing chunk/file {index + 1}/{num_files}: {file_name_for_error}"
+                )
+                # Calculate progress more dynamically
+                self.progress_update.emit(25 + int((55 / num_files) * index))
+
+                with open(audio_file_path, "rb") as audio_file_to_process:
                     transcription_response = (
                         self.openai_client.audio.transcriptions.create(
                             model="whisper-1", file=audio_file_to_process
                         )
                     )
                     transcribed_text = transcription_response.text
-                    logging.info("Transcription finished.")
-                    # Log first 50 chars of transcription for info (avoid very long logs)
-                    logging.info(
-                        f"Transcription (first 50 chars): {transcribed_text[:50]}..."
+                    combined_transcriptions.append(transcribed_text)
+
+                    # Emit individual transcription parts to the UI for responsiveness
+                    separator = "\n\n---\n\n" if index > 0 else ""
+                    self.transcription_finished.emit(
+                        f"{separator}**{file_name_for_error}:**\n{transcribed_text}"
                     )
-                    full_transcription_text = (
-                        transcribed_text  # Assign for saving and display
-                    )
-                    self.transcription_finished.emit(transcribed_text)
-                    self.progress_update.emit(60)
 
-            else:  # If merge_audio is False, process each file individually
-                logging.info("Processing each audio file individually.")
-                self.progress_update.emit(20)
-                combined_transcriptions = []
-                final_transcription_output = (
-                    ""  # Initialize for accumulating markdown transcriptions
-                )
-                for index, audio_file_path in enumerate(self.audio_file_paths):
-                    file_name_for_error = audio_file_path
-                    logging.info(f"Processing file: {audio_file_path}")
-                    self.progress_update.emit(
-                        20 + (60 / len(self.audio_file_paths)) * index
-                    )  # Incremental progress
+            full_transcription_text = "\n\n---\n\n".join(combined_transcriptions)
+            logging.info("All transcription tasks finished.")
+            logging.info(
+                f"Full transcription (first 100 chars): {full_transcription_text[:100]}..."
+            )
+            self.progress_update.emit(80)
 
-                    with open(audio_file_path, "rb") as audio_file_to_process:
-                        logging.info(f"Starting transcription for: {audio_file_path}")
-                        transcription_response = (
-                            self.openai_client.audio.transcriptions.create(
-                                model="whisper-1", file=audio_file_to_process
-                            )
-                        )
-                        transcribed_text = transcription_response.text
-                        logging.info(f"Transcription finished for: {audio_file_path}")
-                        current_file_transcription_markdown = f"**{os.path.basename(audio_file_path)} Trascrizione:**\n{transcribed_text}\n\n"
-                        final_transcription_output += current_file_transcription_markdown  # Accumulate markdown for display
-                        self.transcription_finished.emit(
-                            current_file_transcription_markdown
-                        )  # Emit individual transcription to append on UI
-                        combined_transcriptions.append(
-                            transcribed_text
-                        )  # append just the text, not the markdown
-
-                        self.progress_update.emit(
-                            40 + (60 / len(self.audio_file_paths)) * index
-                        )
-                full_transcription_text = "\n\n".join(
-                    combined_transcriptions
-                )  # Assign concatenated text for saving
-
-                # Emit combined transcriptions (with markdown) AFTER loop to show full result at the end if needed. But we are emitting in loop already for incremental display.
-                # self.transcription_finished.emit(final_transcription_output) # No need to emit again here as we are emitting in loop for incremental display
-
-                self.progress_update.emit(
-                    60
-                )  # Move progress update here after all transcriptions
-
-            # Save transcription to temp file
+            # --- Save transcription to temp file ---
             try:
-                self.temp_transcription_file = tempfile.NamedTemporaryFile(
+                with tempfile.NamedTemporaryFile(
                     suffix=".txt", mode="w", delete=False, encoding="utf-8"
-                )
-                self.temp_transcription_file.write(full_transcription_text)
-                temp_transcription_file_name = (
-                    self.temp_transcription_file.name
-                )  # Capture name before closing
-                self.temp_transcription_file.close()  # Close to ensure content is written
+                ) as self.temp_transcription_file:
+                    self.temp_transcription_file.write(full_transcription_text)
+                    temp_transcription_file_name = self.temp_transcription_file.name
                 logging.info(
                     f"Transcription saved to temporary file: {temp_transcription_file_name}"
                 )
             except Exception as e:
                 logging.error(f"Error saving transcription to temporary file: {e}")
 
-            if (
-                not self.transcription_only
-            ):  # Perform summarization only if transcription_only is False
-                if self.merge_audio:  # Summarize merged transcription
-                    transcription_text_for_summary = full_transcription_text
-                else:  # Summarize concatenated transcriptions
-                    transcription_text_for_summary = full_transcription_text
-
+            # --- Summarization (if not transcription_only) ---
+            if not self.transcription_only:
                 logging.info("Starting summarization with Gemini.")
-                model = self.gemini_client.models.generate_content(
-                    model="gemini-2.5-flash-preview-05-20",
-                    # Use user defined prompt
-                    contents=f"{self.summarization_prompt} {transcription_text_for_summary}",
+                response = self.gemini_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=f"{self.summarization_prompt}\n\n{full_transcription_text}",
                 )
-                summary_text = model.text
+                summary_text = response.text
                 logging.info("Summarization finished.")
-                # Log first 50 chars of summary for info (avoid very long logs)
                 logging.info(f"Summary (first 50 chars): {summary_text[:50]}...")
                 self.progress_update.emit(90)
-                final_summary_output = summary_text  # Assign for final output
-                self.final_summary_markdown = (
-                    final_summary_output  # Store markdown summary for saving
-                )
-                self.summary_finished.emit(
-                    final_summary_output
-                )  # Emit the final summary output (merged or combined)
-            else:  # If transcription_only, skip summarization and just emit a 'finished' signal (can reuse summary_finished for simplicity)
+                self.final_summary_markdown = summary_text
+                self.summary_finished.emit(summary_text)
+            else:
                 final_summary_output = (
                     "Transcription completed - summarization skipped as requested."
                 )
-                self.final_summary_markdown = final_summary_output
-                self.summary_finished.emit(
-                    final_summary_output
-                )  # Emit to signal completion even if no summary
+                self.final_summary_markdown = ""  # No summary to save
+                self.summary_finished.emit(final_summary_output)
                 logging.info("Summarization skipped due to 'Transcription Only' mode.")
 
             self.progress_update.emit(100)
             logging.info("Summarization thread finished successfully.")
 
         except Exception as e:
-            # Use dynamic file name in error
             error_message = f"Error processing {file_name_for_error}: {e}"
-            logging.error(error_message)
-            # Use dynamic file name in error
+            logging.error(error_message, exc_info=True)
             self.error_occurred.emit(error_message, file_name_for_error)
             self.progress_update.emit(0)
         finally:
-            if self.temp_merged_file:
-                # Ensure temp file is deleted
-                os.remove(self.temp_merged_file.name)
-                logging.info(
-                    f"Temporary merged file deleted: {self.temp_merged_file.name}"
-                )
+            # --- Cleanup all temporary files ---
+            for temp_file in self.temp_files_to_clean:
+                try:
+                    os.remove(temp_file.name)
+                    logging.info(f"Temporary file deleted: {temp_file.name}")
+                except OSError as e:
+                    logging.error(f"Error deleting temp file {temp_file.name}: {e}")
+
             if self.temp_transcription_file:
-                # Temporary transcription file is deleted in finally block, but it should be kept for user reference in case of summary failure.
-                # Let's NOT delete the temp transcription file. User can delete it manually if needed.
-                # os.remove(self.temp_transcription_file.name)
                 logging.info(
-                    f"Temporary transcription file kept: {temp_transcription_file_name}"
-                )  # Log that it's kept, not deleted
+                    f"Temporary transcription file kept: {self.temp_transcription_file.name}"
+                )
 
         logging.info("Summarization thread run method completed.")
 
@@ -412,7 +397,9 @@ class AudioSummaryApp(QWidget):
         self.layout.addLayout(file_selection_layout)
 
         # Checkbox for merging audio files
-        self.merge_audio_checkbox = QCheckBox("Unisci file audio", self)
+        self.merge_audio_checkbox = QCheckBox(
+            "Unisci file audio (se < 25MB totali)", self
+        )  # Text updated
         self.merge_audio_checkbox.setChecked(True)  # Default to checked
         self.merge_audio_checkbox.stateChanged.connect(
             self.save_settings
@@ -447,7 +434,7 @@ class AudioSummaryApp(QWidget):
         )  # Save setting on change
         self.layout.addWidget(self.prompt_text_edit)
 
-        self.process_button = QPushButton("Riassumi!!", self)
+        self.process_button = QPushButton("Elabora!", self)  # Text changed
         self.process_button.clicked.connect(self.start_processing)
         self.process_button.setEnabled(False)
         self.layout.addWidget(self.process_button)
@@ -538,7 +525,7 @@ class AudioSummaryApp(QWidget):
             self,
             "Seleziona file audio",
             last_directory,
-            "File Audio (*.ogg *.wav *.mp3 *.flac)",
+            "File Audio (*.ogg *.wav *.mp3 *.flac *.m4a)",  # Added m4a
         )
 
         if file_paths:
@@ -558,7 +545,9 @@ class AudioSummaryApp(QWidget):
             self.audio_file_paths = [path for path, ctime in file_paths_with_ctime]
 
             if len(self.audio_file_paths) == 1:
-                file_display_text = f"File selezionato: {self.audio_file_paths[0]}"
+                file_display_text = (
+                    f"File selezionato: {os.path.basename(self.audio_file_paths[0])}"
+                )
                 logging.info(f"Single audio file selected: {self.audio_file_paths[0]}")
             else:
                 file_display_text = f"{len(self.audio_file_paths)} file selezionati"
@@ -589,59 +578,47 @@ class AudioSummaryApp(QWidget):
             return
 
         openai_key_needed = True
-        gemini_key_needed = (
-            True if not self.transcription_only_checkbox.isChecked() else False
-        )  # Gemini key needed only if not transcription only mode
+        gemini_key_needed = not self.transcription_only_checkbox.isChecked()
 
         if not self.openai_api_key and openai_key_needed:
-            warning_msg_api_keys = "API keys missing (OpenAI)."
-            logging.warning(warning_msg_api_keys)
             QMessageBox.warning(
                 self,
-                "Chiavi API mancanti",
-                "O, imposta OPENAI_API_KEY nel tuo file .env e riavvia.",
+                "Chiave API mancante",
+                "Imposta OPENAI_API_KEY nel tuo file .env e riavvia.",
             )
             return
         if not self.gemini_api_key and gemini_key_needed:
-            warning_msg_api_keys = "API keys missing (Gemini)."
-            logging.warning(warning_msg_api_keys)
             QMessageBox.warning(
                 self,
-                "Chiavi API mancanti",
-                "O, imposta GEMINI_API_KEY nel tuo file .env e riavvia.",
+                "Chiave API mancante",
+                "Imposta GEMINI_API_KEY nel tuo file .env e riavvia.",
             )
             return
 
-        self.status_label.setText("Trascrizione audio e riassunto in corso...")
+        self.status_label.setText("Elaborazione in corso...")
         self.process_button.setEnabled(False)
-        # Disable prompt text edit during processing
         self.prompt_text_edit.setEnabled(False)
         self.progress_bar.setValue(0)
         self.summary_output_text_edit.clear()
         self.transcription_output_text_edit.clear()
 
-        # Get the state of the checkboxes
         merge_audio = self.merge_audio_checkbox.isChecked()
         transcription_only = self.transcription_only_checkbox.isChecked()
         logging.info(f"Merge audio checkbox is checked: {merge_audio}")
         logging.info(f"Transcription only checkbox is checked: {transcription_only}")
 
-        # Get prompt from text edit
-        if transcription_only:
-            summarization_prompt = "-- Solo trascrizione audio --"
-        else:
-            summarization_prompt = self.prompt_text_edit.toPlainText()
-            logging.info(f"Using summarization prompt: {summarization_prompt}")
+        summarization_prompt = (
+            self.prompt_text_edit.toPlainText() if not transcription_only else ""
+        )
 
         logging.info("Creating and starting summarization thread.")
         self.summarization_thread = SummarizationThread(
-            # Pass prompt and merge_audio flag to thread
             self.audio_file_paths,
             self.openai_api_key,
             self.gemini_api_key,
             summarization_prompt,
             merge_audio,
-            transcription_only,  # Pass transcription_only flag
+            transcription_only,
         )
         self.summarization_thread.summary_finished.connect(self.display_result)
         self.summarization_thread.transcription_finished.connect(
@@ -658,105 +635,92 @@ class AudioSummaryApp(QWidget):
         self.summary_output_text_edit.setHtml(html_summary)
         self.status_label.setText("Finito!!")
         self.process_button.setEnabled(True)
-        # Re-enable prompt text edit after processing
-        self.prompt_text_edit.setEnabled(True)
+        # Re-enable prompt text edit after processing if not in transcription only mode
+        if not self.transcription_only_checkbox.isChecked():
+            self.prompt_text_edit.setEnabled(True)
         self.progress_bar.setValue(100)
-        self.summary_markdown_text = summary_text  # Store markdown text
-        self.summary_is_unsaved = True  # Set flag to indicate unsaved summary
+        self.summary_markdown_text = summary_text
+        self.summary_is_unsaved = True if summary_text else False
 
-        self.prompt_save_file()  # Call save file dialog after displaying result
+        self.prompt_save_file()
         logging.info("Summary displayed and UI updated.")
 
     def prompt_save_file(self):
-        logging.info("Prompting user to save file.")
-        file_dialog = QFileDialog()
+        # Determine content type and default file name
+        is_summary = bool(
+            self.summary_markdown_text
+            and "Transcription completed" not in self.summary_markdown_text
+        )
+        if is_summary:
+            content_to_save = self.summary_markdown_text
+            default_suffix = "summary.md"
+            file_filter = "Markdown Files (*.md)"
+            dialog_title = "Salva riassunto come Markdown"
+        else:  # Transcription only
+            content_to_save = self.transcription_output_text_edit.toPlainText()
+            default_suffix = "transcription.txt"
+            file_filter = "Text Files (*.txt)"
+            dialog_title = "Salva trascrizione come testo"
 
-        # Get the last save directory from settings, or use the current directory as default
+        if not content_to_save:
+            logging.info("No content to save.")
+            return
+
+        logging.info(f"Prompting user to save {default_suffix}.")
+        file_dialog = QFileDialog()
         last_save_directory = self.settings.value("lastSaveDirectory", "")
-        default_file_name = os.path.join(
-            last_save_directory,
-            "summary.md" if self.summary_markdown_text else "transcription.txt",
-        )  # Default file name based on summary or transcription
+        default_file_name = os.path.join(last_save_directory, default_suffix)
 
         file_path, _ = file_dialog.getSaveFileName(
-            self,
-            "Salva riassunto come Markdown",
-            default_file_name,
-            "Markdown Files (*.md)",
+            self, dialog_title, default_file_name, file_filter
         )
 
         if file_path:
-            # Save the directory as the last save directory
             last_save_directory = os.path.dirname(file_path)
             self.settings.setValue("lastSaveDirectory", last_save_directory)
             logging.info(f"Last save directory updated to: {last_save_directory}")
-
             try:
                 with open(file_path, "w", encoding="utf-8") as f:
-                    # write markdown text if summary, else write transcription
-                    if self.summary_markdown_text:
-                        f.write(self.summary_markdown_text)
-                    else:
-                        f.write(self.transcription_output_text_edit.toPlainText())
-                logging.info("Summary saved successfully.")
-                self.status_label.setText(f"Riassunto salvato in: {file_path}")
-                self.summary_is_unsaved = False  # Reset flag upon successful save
+                    f.write(content_to_save)
+                logging.info("File saved successfully.")
+                self.status_label.setText(f"File salvato in: {file_path}")
+                self.summary_is_unsaved = False
             except Exception as e:
                 error_msg = f"Errore durante il salvataggio del file: {e}"
                 logging.error(error_msg)
                 QMessageBox.critical(self, "Errore di salvataggio", error_msg)
-                self.status_label.setText(
-                    "Errore durante il salvataggio del riassunto."
-                )
         else:
             logging.info("Save file dialog cancelled by user.")
             self.status_label.setText(
-                "Riassunto markdown non salvato - puoi premere Ctrl+S per salvare."
+                "File non salvato - puoi premere Ctrl+S per salvare."
             )
 
     def handle_save_shortcut(self):
-        """
-        Handles the Ctrl+S shortcut. If a summary exists and is unsaved,
-        it re-triggers the save file dialog.
-        """
-        if self.summary_is_unsaved and self.summary_markdown_text:
-            logging.info("Ctrl+S shortcut activated for unsaved summary.")
+        if self.summary_is_unsaved:
+            logging.info("Ctrl+S shortcut activated for unsaved content.")
             self.prompt_save_file()
         else:
-            logging.info("Ctrl+S shortcut ignored: no unsaved summary available.")
+            logging.info("Ctrl+S shortcut ignored: no unsaved content available.")
 
     def display_transcription(self, transcription_text):
-        logging.info("Displaying transcription.")
-        current_text = self.transcription_output_text_edit.toPlainText()
-        if (
-            current_text
-        ):  # Append only if there's existing text to avoid extra newline at start
-            self.transcription_output_text_edit.append(transcription_text)
-        else:
-            self.transcription_output_text_edit.setText(
-                transcription_text
-            )  # Set text for the first time
-        logging.info("Transcription displayed.")
+        logging.info("Displaying transcription part.")
+        # We use appendHtml to correctly render the markdown-like bolding
+        self.transcription_output_text_edit.append(mistune.html(transcription_text))
+        logging.info("Transcription part displayed.")
 
-    def display_error(
-        self, error_message, file_path
-    ):  # file_path can be string or list
+    def display_error(self, error_message, file_path):
         logging.error(f"Error occurred: {error_message} for file: {file_path}")
         QMessageBox.critical(self, "Errore di elaborazione", error_message)
-        if isinstance(file_path, list):
-            file_name = "merged audio files"
-        else:
-            file_name = os.path.basename(file_path)
+        file_name = os.path.basename(file_path)
         self.status_label.setText(f"Errore durante l'elaborazione di {file_name}.")
         self.process_button.setEnabled(True)
-        # Re-enable prompt text edit after error
-        self.prompt_text_edit.setEnabled(True)
+        if not self.transcription_only_checkbox.isChecked():
+            self.prompt_text_edit.setEnabled(True)
         self.progress_bar.setValue(0)
         logging.error(f"Error displayed in UI for file: {file_name}")
 
     def update_progress(self, progress_value):
         self.progress_bar.setValue(progress_value)
-        # Use debug level as progress updates can be frequent
         logging.debug(f"Progress bar updated to: {progress_value}%")
 
 
