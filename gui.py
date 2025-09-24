@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
+import hashlib
 import logging
 import os
 import sys
-import tempfile
 
 import mistune
 from dotenv import load_dotenv
@@ -12,7 +12,6 @@ from PyQt6.QtCore import QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -30,15 +29,24 @@ logging.basicConfig(
 )
 
 
-class SummarizationThread(QThread):
+def calculate_sha256(file_path):
+    """Calculate SHA-256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        # Read file in chunks to handle large files efficiently
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(chunk)
+    return sha256_hash.digest()
+
+
+class ProcessingThread(QThread):
     """
-    Thread to handle audio processing using the Gemini API for both
-    transcription and summarization. This new version eliminates the need
-    for manual audio splitting/merging by leveraging Gemini's native
-    support for large and multiple audio files.
+    Thread to handle audio processing using the Gemini API.
+    This simplified version uses a single user prompt to guide the AI,
+    which can handle transcription, summarization, or other tasks in one call.
     """
 
-    processing_finished = pyqtSignal(str, bool)  # Emits: (result_text, is_summary)
+    processing_finished = pyqtSignal(str)
     error_occurred = pyqtSignal(str, str)
     progress_update = pyqtSignal(int)
 
@@ -46,31 +54,27 @@ class SummarizationThread(QThread):
         self,
         audio_file_paths,
         gemini_api_key,
-        summarization_prompt,
-        transcription_prompt,
-        transcription_only=False,
+        user_prompt,
     ):
         super().__init__()
         self.audio_file_paths = audio_file_paths
         self.gemini_api_key = gemini_api_key
-        self.summarization_prompt = summarization_prompt
-        self.transcription_prompt = transcription_prompt
-        self.transcription_only = transcription_only
+        self.user_prompt = user_prompt
 
         self.gemini_client = None
-        self.final_summary_markdown = ""
-        self.temp_transcription_file = None
 
     def run(self):
-        logging.info(
-            f"Summarization thread started. Transcription Only: {self.transcription_only}"
-        )
+        logging.info("Processing thread started.")
         file_name_for_error = "audio files"
-        full_transcription_text = ""
-        uploaded_gemini_files = []  # Keep track of files to delete later
+        uploaded_gemini_files = (
+            []
+        )  # Keep track of all files used (cached + newly uploaded)
+        newly_uploaded_files = (
+            []
+        )  # Keep track of only newly uploaded files for deletion
 
         try:
-            # --- API Key and Client Initialization ---
+
             if not self.gemini_api_key:
                 raise ValueError("GEMINI_API_KEY is not set in the .env file")
 
@@ -78,130 +82,102 @@ class SummarizationThread(QThread):
             logging.info("Gemini client initialized.")
             self.progress_update.emit(10)
 
-            # --- Gemini File Upload and Transcription ---
-            # This section replaces all the complex Whisper splitting/merging logic.
-            logging.info("Using Gemini for transcription. Uploading files...")
-            # The 'contents' list will hold the prompt and file references for the API call
+            logging.info(
+                "Checking for existing files and uploading new ones to Gemini..."
+            )
             gemini_contents = []
 
-            # Add the user-defined transcription prompt as the first part of the request
-            gemini_contents.append(self.transcription_prompt)
+            gemini_contents.append(self.user_prompt)
 
-            # Upload each audio file using the Gemini Files API
+            # Get list of existing files from Gemini to check for duplicates
+            logging.info("Fetching existing Gemini files for cache check...")
+            existing_files = {}  # sha256_hash -> gemini_file
+            try:
+                for existing_file in self.gemini_client.files.list():
+                    if (
+                        hasattr(existing_file, "sha256Hash")
+                        and existing_file.sha256Hash
+                    ):
+                        existing_files[existing_file.sha256Hash] = existing_file
+                logging.info(f"Found {len(existing_files)} existing files in Gemini")
+            except Exception as e:
+                logging.warning(f"Could not fetch existing files list: {e}")
+                existing_files = {}
+
             num_files = len(self.audio_file_paths)
+            cache_hits = 0
+            new_uploads = 0
+
             for index, file_path in enumerate(self.audio_file_paths):
                 file_name_for_error = os.path.basename(file_path)
-                # Update progress during the upload process
-                progress = 15 + int((55 / num_files) * index)
+                progress = 15 + int((75 / num_files) * index)
                 self.progress_update.emit(progress)
+
+                # Calculate SHA-256 hash of the local file
                 logging.info(
-                    f"Uploading file {index + 1}/{num_files}: {file_name_for_error}..."
+                    f"Processing file {index + 1}/{num_files}: {file_name_for_error}..."
                 )
+                try:
+                    local_hash = calculate_sha256(file_path)
+                    # Convert to base64 string to match Gemini's format
+                    import base64
 
-                # The core upload call
-                gemini_file = self.gemini_client.files.upload(file=file_path)
-                gemini_contents.append(gemini_file)
-                uploaded_gemini_files.append(gemini_file)  # Track for cleanup
-                logging.info(f"Successfully uploaded {gemini_file.name}")
+                    local_hash_b64 = base64.b64encode(local_hash).decode("utf-8")
 
-            logging.info("All files uploaded.")
-            self.progress_update.emit(70)
-
-            # --- NEW LOGIC: Conditional API Call ---
-            if self.transcription_only:
-                # --- SCENARIO 1: TRANSCRIPTION ONLY (Existing Logic) ---
-                logging.info("Requesting transcription from Gemini...")
-
-                # Build contents for transcription
-                gemini_contents.append(self.transcription_prompt)
-
-                transcription_response = self.gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=gemini_contents,
-                )
-                full_transcription_text = transcription_response.text
-
-                # Emit the new single signal with is_summary=False for transcription only
-                self.processing_finished.emit(full_transcription_text, False)
-                logging.info("Transcription-only result sent to UI.")
-
-            else:
-                # --- SCENARIO 2: TRANSCRIPTION AND SUMMARY (New Single-Call Logic) ---
-                logging.info(
-                    "Requesting transcription AND summary from Gemini in a single call..."
-                )
-
-                # Build contents for the combined task. The summarization_prompt is now the main prompt.
-                gemini_contents.append(self.summarization_prompt)
-
-                combined_response = self.gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=gemini_contents,
-                )
-                combined_text = combined_response.text
-
-                # --- PARSE THE RESPONSE ---
-                # We expect the model to follow the prompt's structure.
-                # Let's use robust splitting to separate the two parts.
-                full_transcription_text = ""
-                summary_text = ""
-
-                # Use unique markers that we will define in the new default prompt.
-                transcription_marker = "**Trascrizione:**"
-                summary_marker = "**Riassunto:**"
-
-                if summary_marker in combined_text:
-                    parts = combined_text.split(summary_marker, 1)
-                    if transcription_marker in parts[0]:
-                        # Extract transcription from the first part
-                        full_transcription_text = (
-                            parts[0].replace(transcription_marker, "").strip()
+                    # Check if file already exists in Gemini
+                    if local_hash_b64 in existing_files:
+                        existing_file = existing_files[local_hash_b64]
+                        logging.info(
+                            f"File {file_name_for_error} already exists in Gemini (cache hit): {existing_file.name}"
                         )
+                        gemini_contents.append(existing_file)
+                        uploaded_gemini_files.append(
+                            existing_file
+                        )  # Track for content generation (but don't delete)
+                        cache_hits += 1
                     else:
-                        # If the transcription marker is missing, assume the first part is the transcription
-                        full_transcription_text = parts[0].strip()
-                    summary_text = parts[1].strip()
-                else:
-                    # Fallback if the model doesn't follow instructions perfectly
-                    logging.warning(
-                        "Summary marker not found in response. Treating the whole response as the summary."
-                    )
-                    summary_text = combined_text
-                    # We can't reliably extract the transcription in this case
-                    full_transcription_text = "Could not be separated from the summary."
+                        # Upload new file
+                        logging.info(f"Uploading new file: {file_name_for_error}...")
+                        gemini_file = self.gemini_client.files.upload(file=file_path)
+                        gemini_contents.append(gemini_file)
+                        uploaded_gemini_files.append(gemini_file)
+                        newly_uploaded_files.append(gemini_file)  # Track for deletion
+                        logging.info(f"Successfully uploaded {gemini_file.name}")
+                        new_uploads += 1
 
-                logging.info("Transcription and summary received and parsed.")
-
-                # Create a single, combined markdown string for output
-                combined_markdown_output = (
-                    f"## Riassunto\n\n{summary_text}\n\n"
-                    f"---\n\n"
-                    f"## Trascrizione\n\n{full_transcription_text}"
-                )
-
-                # Emit the new single signal with is_summary=True for combined content
-                self.processing_finished.emit(combined_markdown_output, True)
-                logging.info("Combined summary and transcription result sent to UI.")
-
-                # Also update the variable used for saving
-                self.final_summary_markdown = combined_markdown_output
-
-            self.progress_update.emit(95)  # A bit of progress left for cleanup
-
-            # --- Save transcription to temp file (Optional but can be useful) ---
-            try:
-                with tempfile.NamedTemporaryFile(
-                    suffix=".txt", mode="w", delete=False, encoding="utf-8"
-                ) as self.temp_transcription_file:
-                    self.temp_transcription_file.write(full_transcription_text)
+                except Exception as e:
+                    logging.warning(f"Error processing file {file_name_for_error}: {e}")
+                    # Fallback to direct upload if hash calculation fails
                     logging.info(
-                        f"Transcription saved to temporary file: {self.temp_transcription_file.name}"
+                        f"Falling back to direct upload for: {file_name_for_error}"
                     )
-            except Exception as e:
-                logging.error(f"Error saving transcription to temporary file: {e}")
+                    gemini_file = self.gemini_client.files.upload(file=file_path)
+                    gemini_contents.append(gemini_file)
+                    uploaded_gemini_files.append(gemini_file)
+                    newly_uploaded_files.append(gemini_file)  # Track for deletion
+                    new_uploads += 1
+
+            logging.info(
+                f"File processing summary: {cache_hits} cached, {new_uploads} newly uploaded"
+            )
+
+            logging.info("All files uploaded. Requesting generation from Gemini...")
+            self.progress_update.emit(90)
+
+            # No more conditional logic. The user's prompt dictates the entire task.
+            response = self.gemini_client.models.generate_content(
+                model="gemini-1.5-flash",  # Using 1.5-flash as it's great for this
+                contents=gemini_contents,
+            )
+            result_text = response.text
+
+            logging.info("Received response from Gemini.")
+            self.progress_update.emit(95)
+
+            self.processing_finished.emit(result_text)
 
             self.progress_update.emit(100)
-            logging.info("Summarization thread finished successfully.")
+            logging.info("Processing thread finished successfully.")
 
         except Exception as e:
             error_message = f"Error processing {file_name_for_error}: {e}"
@@ -209,9 +185,11 @@ class SummarizationThread(QThread):
             self.error_occurred.emit(error_message, file_name_for_error)
             self.progress_update.emit(0)
         finally:
-            # --- Cleanup: Delete uploaded files from the Gemini service ---
-            logging.info("Cleaning up uploaded Gemini files...")
-            for gemini_file in uploaded_gemini_files:
+            # Clean up only newly uploaded files, not cached ones
+            logging.info(
+                f"Cleaning up {len(newly_uploaded_files)} newly uploaded Gemini files..."
+            )
+            for gemini_file in newly_uploaded_files:
                 try:
                     self.gemini_client.files.delete(file=gemini_file)
                     logging.info(f"Deleted remote file from Gemini: {gemini_file.name}")
@@ -220,17 +198,20 @@ class SummarizationThread(QThread):
                         f"Could not delete Gemini file {gemini_file.name}: {e}"
                     )
 
-            if self.temp_transcription_file:
+            if len(newly_uploaded_files) == 0:
                 logging.info(
-                    f"Temporary transcription file kept: {self.temp_transcription_file.name}"
+                    "No newly uploaded files to clean up (all files were cached)"
                 )
-
-        logging.info("Summarization thread run method completed.")
+            else:
+                logging.info(
+                    "Cleanup completed. Cached files were preserved for future use."
+                )
+        logging.info("Processing thread run method completed.")
 
 
 class AudioSummaryApp(QWidget):
-    DEFAULT_PROMPT = "Riassumi il contenuto dei file audio forniti."
-    DEFAULT_TRANSCRIPTION_PROMPT = "Genera una trascrizione dei file audio forniti."
+
+    DEFAULT_PROMPT = "Esegui una trascrizione e riassunto dei file audio forniti."
 
     def __init__(self):
         logging.info("AudioSummaryApp initialization started.")
@@ -240,11 +221,10 @@ class AudioSummaryApp(QWidget):
 
         self.gemini_api_key = None
         self.load_api_key()
-        self.summarization_thread = None
+        self.processing_thread = None
         self.audio_file_paths = []
-        self.summary_markdown_text = ""
-        self.summary_is_unsaved = False
-        self.last_result_is_summary = False
+        self.last_result_text = ""
+        self.result_is_unsaved = False
         self.settings = QSettings("BitreyDev", "AudioSummaryApp")
 
         self.init_ui()
@@ -253,6 +233,7 @@ class AudioSummaryApp(QWidget):
         logging.info("AudioSummaryApp initialization completed.")
 
     def apply_dark_theme(self):
+        # ... (no changes here, keeping the theme)
         logging.info("Applying dark theme.")
         self.setStyleSheet(
             """
@@ -319,6 +300,7 @@ class AudioSummaryApp(QWidget):
         logging.info("Dark theme applied.")
 
     def load_api_key(self):
+        # ... (no changes here)
         logging.info("Loading API keys from .env file.")
         load_dotenv()
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -351,34 +333,12 @@ class AudioSummaryApp(QWidget):
 
         self.layout.addLayout(file_selection_layout)
 
-        # Checkbox for transcription only mode - Merging checkbox is now removed.
-        self.transcription_only_checkbox = QCheckBox("Esegui SOLO trascrizione", self)
-        self.transcription_only_checkbox.setChecked(False)
-        self.transcription_only_checkbox.stateChanged.connect(self.save_settings)
-        self.transcription_only_checkbox.stateChanged.connect(
-            self.update_prompt_textbox_state
-        )
-        self.layout.addWidget(self.transcription_only_checkbox)
-
-        # Prompt text box for transcription
-        self.transcription_prompt_label = QLabel("Prompt per la Trascrizione:", self)
-        self.layout.addWidget(self.transcription_prompt_label)
-        self.transcription_prompt_text_edit = QTextEdit(self)
-        self.transcription_prompt_text_edit.setFixedHeight(100)
-        # Don't set default text here - let load_settings() handle it
-        self.transcription_prompt_text_edit.textChanged.connect(self.save_settings)
-        self.layout.addWidget(self.transcription_prompt_text_edit)
-
-        # Prompt text box for summarization
-        self.prompt_label = QLabel("Prompt per Gemini (Riassunto):", self)
+        self.prompt_label = QLabel("Prompt per Gemini (cosa fare con l'audio?):", self)
         self.layout.addWidget(self.prompt_label)
-        self.prompt_text_edit = QTextEdit(self)
-        self.prompt_text_edit.setFixedHeight(180)
-        # Don't set default text here - let load_settings() handle it
-        self.prompt_text_edit.textChanged.connect(self.save_settings)
-        self.layout.addWidget(self.prompt_text_edit)
-
-        # --- Whisper settings UI has been removed ---
+        self.user_prompt_text_edit = QTextEdit(self)
+        self.user_prompt_text_edit.setFixedHeight(180)
+        self.user_prompt_text_edit.textChanged.connect(self.save_settings)
+        self.layout.addWidget(self.user_prompt_text_edit)
 
         self.process_button = QPushButton("Elabora!", self)
         self.process_button.clicked.connect(self.start_processing)
@@ -403,69 +363,28 @@ class AudioSummaryApp(QWidget):
         save_shortcut.activated.connect(self.handle_save_shortcut)
 
         logging.info("User interface initialized.")
-        self.update_prompt_textbox_state()
-        logging.info("Initial prompt textbox state set.")
-
-    def update_prompt_textbox_state(self):
-        is_transcription_only = self.transcription_only_checkbox.isChecked()
-
-        # Summary prompt is enabled ONLY if transcription_only is FALSE
-        self.prompt_text_edit.setEnabled(not is_transcription_only)
-        self.prompt_label.setEnabled(not is_transcription_only)
-
-        # NEW: Transcription prompt is enabled ONLY if transcription_only is TRUE
-        self.transcription_prompt_text_edit.setEnabled(is_transcription_only)
-        self.transcription_prompt_label.setEnabled(is_transcription_only)
 
     def load_settings(self):
         logging.info("Loading settings from QSettings.")
-
-        # Temporarily disconnect textChanged signals to avoid triggering save_settings during load
-        self.transcription_prompt_text_edit.textChanged.disconnect()
-        self.prompt_text_edit.textChanged.disconnect()
-
-        saved_transcription_prompt = self.settings.value(
-            "transcriptionPromptText", self.DEFAULT_TRANSCRIPTION_PROMPT
-        )
-        self.transcription_prompt_text_edit.setPlainText(saved_transcription_prompt)
-
-        saved_prompt = self.settings.value("promptText", self.DEFAULT_PROMPT)
-        self.prompt_text_edit.setPlainText(saved_prompt)
-
-        saved_transcription_only_checked = self.settings.value(
-            "transcriptionOnlyChecked", False, type=bool
-        )
-
-        self.transcription_only_checkbox.setChecked(saved_transcription_only_checked)
-
-        # Reconnect the textChanged signals
-        self.transcription_prompt_text_edit.textChanged.connect(self.save_settings)
-        self.prompt_text_edit.textChanged.connect(self.save_settings)
-
+        self.user_prompt_text_edit.textChanged.disconnect()
+        saved_prompt = self.settings.value("userPrompt", self.DEFAULT_PROMPT)
+        self.user_prompt_text_edit.setPlainText(saved_prompt)
+        self.user_prompt_text_edit.textChanged.connect(self.save_settings)
         logging.info("Settings loaded.")
 
     def save_settings(self):
         logging.info("Saving settings to QSettings.")
-        self.settings.setValue(
-            "transcriptionPromptText", self.transcription_prompt_text_edit.toPlainText()
-        )
-        self.settings.setValue("promptText", self.prompt_text_edit.toPlainText())
-        self.settings.setValue(
-            "transcriptionOnlyChecked", self.transcription_only_checkbox.isChecked()
-        )
+        self.settings.setValue("userPrompt", self.user_prompt_text_edit.toPlainText())
         logging.info("Settings saved.")
 
     def reset_prompt(self):
-        logging.info("Resetting prompt and checkbox to default.")
-        self.transcription_prompt_text_edit.setPlainText(
-            self.DEFAULT_TRANSCRIPTION_PROMPT
-        )
-        self.prompt_text_edit.setPlainText(self.DEFAULT_PROMPT)
-        self.transcription_only_checkbox.setChecked(False)
+        logging.info("Resetting prompt to default.")
+        self.user_prompt_text_edit.setPlainText(self.DEFAULT_PROMPT)
         self.save_settings()
-        logging.info("Prompt and checkbox reset to default.")
+        logging.info("Prompt reset to default.")
 
     def select_audio_file(self):
+        # ... (no changes in this method, it's already good)
         logging.info("Select audio file button clicked.")
         file_dialog = QFileDialog()
         last_directory = self.settings.value("lastInputDirectory", "")
@@ -508,7 +427,7 @@ class AudioSummaryApp(QWidget):
 
     def start_processing(self):
         logging.info("Start processing button clicked.")
-        self.summary_is_unsaved = False
+        self.result_is_unsaved = False
         if not self.audio_file_paths:
             QMessageBox.warning(
                 self, "Nessun file selezionato", "O, seleziona prima un file audio."
@@ -525,74 +444,60 @@ class AudioSummaryApp(QWidget):
 
         self.status_label.setText("Elaborazione in corso...")
         self.process_button.setEnabled(False)
-        self.update_prompt_textbox_state()  # Ensure prompt is disabled if needed
+        self.user_prompt_text_edit.setEnabled(False)  # Disable prompt during processing
         self.progress_bar.setValue(0)
         self.output_text_edit.clear()
 
-        transcription_only = self.transcription_only_checkbox.isChecked()
-        summarization_prompt = (
-            self.prompt_text_edit.toPlainText() if not transcription_only else ""
-        )
-        transcription_prompt = self.transcription_prompt_text_edit.toPlainText()
+        user_prompt = self.user_prompt_text_edit.toPlainText()
 
-        logging.info("Creating and starting summarization thread.")
-        self.summarization_thread = SummarizationThread(
+        logging.info("Creating and starting processing thread.")
+
+        self.processing_thread = ProcessingThread(
             self.audio_file_paths,
             self.gemini_api_key,
-            summarization_prompt,
-            transcription_prompt,
-            transcription_only,
+            user_prompt,
         )
-        self.summarization_thread.processing_finished.connect(self.display_result)
-        self.summarization_thread.error_occurred.connect(self.display_error)
-        self.summarization_thread.progress_update.connect(self.update_progress)
-        self.summarization_thread.start()
-        logging.info("Summarization thread started.")
+        self.processing_thread.processing_finished.connect(self.display_result)
+        self.processing_thread.error_occurred.connect(self.display_error)
+        self.processing_thread.progress_update.connect(self.update_progress)
+        self.processing_thread.start()
+        logging.info("Processing thread started.")
 
-    def display_result(self, result_text, is_summary):
-        logging.info(f"Displaying result. Is summary: {is_summary}")
+    def display_result(self, result_text):
+        logging.info("Displaying result from Gemini.")
 
-        if is_summary:
-            # If it's a summary, it contains Markdown. Render it as HTML.
-            html_content = mistune.html(result_text)
-            self.output_text_edit.setHtml(html_content)
-        else:
-            # Otherwise, it's a plain text transcription.
-            self.output_text_edit.setPlainText(result_text)
+        html_content = mistune.html(result_text)
+        self.output_text_edit.setHtml(html_content)
 
         self.status_label.setText("Finito!!")
         self.process_button.setEnabled(True)
-        self.update_prompt_textbox_state()
+        self.user_prompt_text_edit.setEnabled(True)
         self.progress_bar.setValue(100)
 
-        # This variable is used for saving the file later
-        self.last_result_is_summary = is_summary
-        self.summary_markdown_text = result_text
-        self.summary_is_unsaved = bool(result_text)
+        # Store result for saving
+        self.last_result_text = result_text
+        self.result_is_unsaved = bool(result_text)
 
         self.prompt_save_file()
         logging.info("Result displayed and UI updated.")
 
     def prompt_save_file(self):
-        # The new flag makes this logic cleaner and more reliable.
-        if self.last_result_is_summary:
-            content_to_save = self.summary_markdown_text
-            default_suffix = "summary.md"
-            file_filter = "Markdown Files (*.md)"
-            dialog_title = "Salva riassunto e trascrizione come Markdown"
-        else:
-            # This handles the transcription-only case
-            content_to_save = self.output_text_edit.toPlainText()
-            default_suffix = "transcription.txt"
-            file_filter = "Text Files (*.txt)"
-            dialog_title = "Salva trascrizione come testo"
-
-        if not content_to_save:
+        if not self.last_result_text:
             return
+
+        default_suffix = "summary.md"
+        file_filter = "Markdown Files (*.md)"
+        dialog_title = "Salva riassunto/trascrizione come Markdown"
+        content_to_save = self.last_result_text
 
         file_dialog = QFileDialog()
         last_save_directory = self.settings.value("lastSaveDirectory", "")
-        default_file_name = os.path.join(last_save_directory, default_suffix)
+        # Use the first audio file's name as a base for the output file
+        base_name = os.path.splitext(os.path.basename(self.audio_file_paths[0]))[0]
+        default_file_name = os.path.join(
+            last_save_directory, f"{base_name}_{default_suffix}"
+        )
+
         file_path, _ = file_dialog.getSaveFileName(
             self, dialog_title, default_file_name, file_filter
         )
@@ -604,7 +509,7 @@ class AudioSummaryApp(QWidget):
                 with open(file_path, "w", encoding="utf-8") as f:
                     f.write(content_to_save)
                 self.status_label.setText(f"File salvato in: {file_path}")
-                self.summary_is_unsaved = False
+                self.result_is_unsaved = False
             except Exception as e:
                 QMessageBox.critical(
                     self,
@@ -617,7 +522,7 @@ class AudioSummaryApp(QWidget):
             )
 
     def handle_save_shortcut(self):
-        if self.summary_is_unsaved:
+        if self.result_is_unsaved:
             self.prompt_save_file()
 
     def display_error(self, error_message, file_path):
@@ -626,7 +531,7 @@ class AudioSummaryApp(QWidget):
         file_name = os.path.basename(file_path)
         self.status_label.setText(f"Errore durante l'elaborazione di {file_name}.")
         self.process_button.setEnabled(True)
-        self.update_prompt_textbox_state()
+        self.user_prompt_text_edit.setEnabled(True)
         self.progress_bar.setValue(0)
         logging.error(f"Error displayed in UI for file: {file_name}")
 
