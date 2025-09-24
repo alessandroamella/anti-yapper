@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (  # Import QCheckBox
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -49,6 +50,7 @@ class SummarizationThread(QThread):
     error_occurred = pyqtSignal(str, str)
     progress_update = pyqtSignal(int)
 
+    # --- MODIFY THE __init__ signature ---
     def __init__(
         self,
         audio_file_paths,
@@ -57,7 +59,10 @@ class SummarizationThread(QThread):
         summarization_prompt,
         merge_audio=True,
         transcription_only=False,
+        whisper_language="",  # new, with a default
+        whisper_prompt="",  # new, with a default
     ):
+        # --- END MODIFICATION ---
         super().__init__()
         self.audio_file_paths = audio_file_paths
         self.openai_api_key = openai_api_key
@@ -65,6 +70,12 @@ class SummarizationThread(QThread):
         self.summarization_prompt = summarization_prompt
         self.merge_audio = merge_audio
         self.transcription_only = transcription_only
+
+        # --- ADD THESE LINES to store the new values ---
+        self.whisper_language = whisper_language
+        self.whisper_prompt = whisper_prompt
+        # --- END ---
+
         self.openai_client = None
         self.gemini_client = None
         self.temp_files_to_clean = []  # Store all temp file objects for cleanup
@@ -190,11 +201,31 @@ class SummarizationThread(QThread):
                 self.progress_update.emit(25 + int((55 / num_files) * index))
 
                 with open(audio_file_path, "rb") as audio_file_to_process:
+                    # --- PREPARE PARAMS DICTIONARY ---
+                    transcription_params = {
+                        "model": "whisper-1",
+                        "file": audio_file_to_process,
+                    }
+                    if self.whisper_language:  # Only add if not empty
+                        transcription_params["language"] = self.whisper_language
+                    if self.whisper_prompt:  # Only add if not empty
+                        transcription_params["prompt"] = self.whisper_prompt
+
+                    # --- MAKE THE API CALL WITH THE PARAMS ---
                     transcription_response = (
                         self.openai_client.audio.transcriptions.create(
-                            model="whisper-1", file=audio_file_to_process
+                            **transcription_params
                         )
                     )
+
+                    # --- The old, hard-coded line to be replaced is below ---
+                    # transcription_response = self.openai_client.audio.transcriptions.create(
+                    #     model="whisper-1",
+                    #     file=audio_file_to_process,
+                    #     language="it",  # Set language to Italian (it)
+                    #     prompt="Trascrivi in italiano una conversazione tra due persone, provando a capire chi parla.",
+                    # )
+
                     transcribed_text = transcription_response.text
                     combined_transcriptions.append(transcribed_text)
 
@@ -434,6 +465,40 @@ class AudioSummaryApp(QWidget):
         )  # Save setting on change
         self.layout.addWidget(self.prompt_text_edit)
 
+        # --- START: New Whisper Settings UI ---
+
+        # Add a separator or label for clarity
+        self.whisper_settings_label = QLabel("--- Impostazioni Whisper ---", self)
+        self.layout.addWidget(self.whisper_settings_label)
+
+        # Whisper Language Input
+        whisper_language_layout = QHBoxLayout()
+        self.whisper_language_label = QLabel("Lingua (es: it, en):", self)
+        # We use QLineEdit for a short text input
+        self.whisper_language_input = QLineEdit(self)
+        self.whisper_language_input.setPlaceholderText("lascia vuoto per auto-detect")
+        self.whisper_language_input.setText("it")  # Set default to Italian
+        self.whisper_language_input.textChanged.connect(self.save_settings)
+        whisper_language_layout.addWidget(self.whisper_language_label)
+        whisper_language_layout.addWidget(self.whisper_language_input)
+        self.layout.addLayout(whisper_language_layout)
+
+        # Whisper Prompt Input
+        self.whisper_prompt_label = QLabel("Prompt per Whisper (opzionale):", self)
+        self.layout.addWidget(self.whisper_prompt_label)
+        # We use QTextEdit for a potentially longer prompt
+        self.whisper_prompt_text_edit = QTextEdit(self)
+        self.whisper_prompt_text_edit.setFixedHeight(
+            80
+        )  # A bit shorter than the Gemini one
+        self.whisper_prompt_text_edit.setPlainText(
+            "Trascrivi in italiano una conversazione tra due persone, provando a capire chi parla."
+        )
+        self.whisper_prompt_text_edit.textChanged.connect(self.save_settings)
+        self.layout.addWidget(self.whisper_prompt_text_edit)
+
+        # --- END: New Whisper Settings UI ---
+
         self.process_button = QPushButton("Elabora!", self)  # Text changed
         self.process_button.clicked.connect(self.start_processing)
         self.process_button.setEnabled(False)
@@ -493,6 +558,17 @@ class AudioSummaryApp(QWidget):
         self.prompt_text_edit.setPlainText(saved_prompt)
         self.merge_audio_checkbox.setChecked(saved_checkbox_checked)
         self.transcription_only_checkbox.setChecked(saved_transcription_only_checked)
+
+        # --- ADD THESE LINES ---
+        saved_whisper_lang = self.settings.value("whisperLanguage", "it")
+        saved_whisper_prompt = self.settings.value(
+            "whisperPrompt",
+            "Trascrivi in italiano una conversazione tra due persone, provando a capire chi parla.",
+        )
+        self.whisper_language_input.setText(saved_whisper_lang)
+        self.whisper_prompt_text_edit.setPlainText(saved_whisper_prompt)
+        # --- END ---
+
         logging.info("Settings loaded.")
 
     def save_settings(self):
@@ -504,6 +580,12 @@ class AudioSummaryApp(QWidget):
         self.settings.setValue(
             "transcriptionOnlyChecked", self.transcription_only_checkbox.isChecked()
         )
+        # --- ADD THESE LINES ---
+        self.settings.setValue("whisperLanguage", self.whisper_language_input.text())
+        self.settings.setValue(
+            "whisperPrompt", self.whisper_prompt_text_edit.toPlainText()
+        )
+        # --- END ---
         logging.info("Settings saved.")
 
     def reset_prompt(self):
@@ -611,7 +693,13 @@ class AudioSummaryApp(QWidget):
             self.prompt_text_edit.toPlainText() if not transcription_only else ""
         )
 
+        # --- ADD THESE LINES to get values from the new UI fields ---
+        whisper_language = self.whisper_language_input.text()
+        whisper_prompt = self.whisper_prompt_text_edit.toPlainText()
+        # --- END ---
+
         logging.info("Creating and starting summarization thread.")
+        # --- MODIFY THIS LINE to pass the new variables ---
         self.summarization_thread = SummarizationThread(
             self.audio_file_paths,
             self.openai_api_key,
@@ -619,7 +707,10 @@ class AudioSummaryApp(QWidget):
             summarization_prompt,
             merge_audio,
             transcription_only,
+            whisper_language,  # new
+            whisper_prompt,  # new
         )
+        # --- END MODIFICATION ---
         self.summarization_thread.summary_finished.connect(self.display_result)
         self.summarization_thread.transcription_finished.connect(
             self.display_transcription
