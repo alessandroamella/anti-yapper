@@ -4,14 +4,17 @@ import hashlib
 import logging
 import os
 import sys
+import base64
 
 import mistune
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from PyQt6.QtCore import QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -36,7 +39,7 @@ def calculate_sha256(file_path):
         # Read file in chunks to handle large files efficiently
         for chunk in iter(lambda: f.read(4096), b""):
             sha256_hash.update(chunk)
-    return sha256_hash.digest()
+    return sha256_hash.hexdigest()
 
 
 class ProcessingThread(QThread):
@@ -56,11 +59,13 @@ class ProcessingThread(QThread):
         audio_file_paths,
         gemini_api_key,
         user_prompt,
+        enable_search=False,
     ):
         super().__init__()
         self.audio_file_paths = audio_file_paths
         self.gemini_api_key = gemini_api_key
         self.user_prompt = user_prompt
+        self.enable_search = enable_search
 
         self.gemini_client = None
 
@@ -128,10 +133,14 @@ class ProcessingThread(QThread):
                 )
                 try:
                     local_hash = calculate_sha256(file_path)
-                    # Convert to base64 string to match Gemini's format
-                    import base64
+                    # Convert hex string to base64 to match Gemini's format
+                    local_hash_b64 = base64.b64encode(
+                        local_hash.encode("utf-8")
+                    ).decode("utf-8")
 
-                    local_hash_b64 = base64.b64encode(local_hash).decode("utf-8")
+                    logging.info(
+                        f"Local SHA-256 for {file_name_for_error}: {local_hash_b64}"
+                    )
 
                     # Check if file already exists in Gemini
                     if local_hash_b64 in existing_files:
@@ -180,10 +189,20 @@ class ProcessingThread(QThread):
             logging.info("All files uploaded. Requesting generation from Gemini...")
             self.progress_update.emit(50)
 
-            # No more conditional logic. The user's prompt dictates the entire task.
+            # Prepara la configurazione per la generazione dei contenuti
+            content_config = None
+            if self.enable_search:
+                logging.info("Grounding with Google Search is ENABLED.")
+                grounding_tool = types.Tool(google_search=types.GoogleSearch())
+                content_config = types.GenerateContentConfig(tools=[grounding_tool])
+            else:
+                logging.info("Grounding with Google Search is DISABLED.")
+
+            # Esegui la chiamata a Gemini, includendo la configurazione se presente
             response = self.gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=gemini_contents,
+                config=content_config,
             )
             result_text = response.text
 
@@ -234,7 +253,6 @@ class AudioSummaryApp(QWidget):
         logging.info("AudioSummaryApp initialization completed.")
 
     def apply_dark_theme(self):
-        # ... (no changes here, keeping the theme)
         logging.info("Applying dark theme.")
         self.setStyleSheet(
             """
@@ -301,7 +319,6 @@ class AudioSummaryApp(QWidget):
         logging.info("Dark theme applied.")
 
     def load_api_key(self):
-        # ... (no changes here)
         logging.info("Loading API keys from .env file.")
         load_dotenv()
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -340,6 +357,14 @@ class AudioSummaryApp(QWidget):
         self.user_prompt_text_edit.setFixedHeight(180)
         self.user_prompt_text_edit.textChanged.connect(self.save_settings)
         self.layout.addWidget(self.user_prompt_text_edit)
+
+        # Aggiungi la checkbox per la ricerca Google
+        self.search_checkbox = QCheckBox(
+            "Abilita ricerca Google (per risposte più aggiornate su eventi recenti)",
+            self,
+        )
+        self.search_checkbox.setChecked(False)  # Imposta lo stato predefinito
+        self.layout.addWidget(self.search_checkbox)
 
         self.process_button = QPushButton("Elabora!", self)
         self.process_button.clicked.connect(self.start_processing)
@@ -385,7 +410,6 @@ class AudioSummaryApp(QWidget):
         logging.info("Prompt reset to default.")
 
     def select_audio_file(self):
-        # ... (no changes in this method, it's already good)
         logging.info("Select audio file button clicked.")
         file_dialog = QFileDialog()
         last_directory = self.settings.value("lastInputDirectory", "")
@@ -446,10 +470,14 @@ class AudioSummaryApp(QWidget):
         self.status_label.setText("Avvio del processo...")
         self.process_button.setEnabled(False)
         self.user_prompt_text_edit.setEnabled(False)  # Disable prompt during processing
+        self.search_checkbox.setEnabled(False)  # Disabilita anche la checkbox
         self.progress_bar.setValue(0)
         self.output_text_edit.clear()
 
         user_prompt = self.user_prompt_text_edit.toPlainText()
+
+        # Leggi lo stato della checkbox
+        use_google_search = self.search_checkbox.isChecked()
 
         logging.info("Creating and starting processing thread.")
 
@@ -457,6 +485,7 @@ class AudioSummaryApp(QWidget):
             self.audio_file_paths,
             self.gemini_api_key,
             user_prompt,
+            enable_search=use_google_search,
         )
         self.processing_thread.processing_finished.connect(self.display_result)
         self.processing_thread.error_occurred.connect(self.display_error)
@@ -474,6 +503,7 @@ class AudioSummaryApp(QWidget):
         self.status_label.setText("Finito!!")
         self.process_button.setEnabled(True)
         self.user_prompt_text_edit.setEnabled(True)
+        self.search_checkbox.setEnabled(True)  # Riattiva la checkbox
         self.progress_bar.setValue(100)
 
         # Store result for saving
@@ -534,6 +564,7 @@ class AudioSummaryApp(QWidget):
         self.status_label.setText(f"Errore durante l'elaborazione di {file_name}.")
         self.process_button.setEnabled(True)
         self.user_prompt_text_edit.setEnabled(True)
+        self.search_checkbox.setEnabled(True)  # Riattiva la checkbox
         self.progress_bar.setValue(0)
         logging.error(f"Error displayed in UI for file: {file_name}")
 
