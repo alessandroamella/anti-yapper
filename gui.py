@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 
 # Configure logging to console
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 
@@ -49,6 +49,7 @@ class ProcessingThread(QThread):
     processing_finished = pyqtSignal(str)
     error_occurred = pyqtSignal(str, str)
     progress_update = pyqtSignal(int)
+    status_update = pyqtSignal(str)
 
     def __init__(
         self,
@@ -78,6 +79,7 @@ class ProcessingThread(QThread):
             if not self.gemini_api_key:
                 raise ValueError("GEMINI_API_KEY is not set in the .env file")
 
+            self.status_update.emit("Inizializzazione client Gemini...")
             self.gemini_client = genai.Client(api_key=self.gemini_api_key)
             logging.info("Gemini client initialized.")
             self.progress_update.emit(10)
@@ -90,15 +92,19 @@ class ProcessingThread(QThread):
             gemini_contents.append(self.user_prompt)
 
             # Get list of existing files from Gemini to check for duplicates
+            self.status_update.emit("Controllo file cache su Gemini...")
             logging.info("Fetching existing Gemini files for cache check...")
             existing_files = {}  # sha256_hash -> gemini_file
             try:
                 for existing_file in self.gemini_client.files.list():
                     if (
-                        hasattr(existing_file, "sha256Hash")
-                        and existing_file.sha256Hash
+                        hasattr(existing_file, "sha256_hash")
+                        and existing_file.sha256_hash
                     ):
-                        existing_files[existing_file.sha256Hash] = existing_file
+                        existing_files[existing_file.sha256_hash] = existing_file
+                    logging.debug(
+                        f"Existing file: {existing_file.name}, SHA-256: {existing_file.sha256_hash}"
+                    )
                 logging.info(f"Found {len(existing_files)} existing files in Gemini")
             except Exception as e:
                 logging.warning(f"Could not fetch existing files list: {e}")
@@ -114,6 +120,9 @@ class ProcessingThread(QThread):
                 self.progress_update.emit(progress)
 
                 # Calculate SHA-256 hash of the local file
+                self.status_update.emit(
+                    f"File {index + 1}/{num_files}: Calcolo hash per {file_name_for_error}..."
+                )
                 logging.info(
                     f"Processing file {index + 1}/{num_files}: {file_name_for_error}..."
                 )
@@ -127,6 +136,9 @@ class ProcessingThread(QThread):
                     # Check if file already exists in Gemini
                     if local_hash_b64 in existing_files:
                         existing_file = existing_files[local_hash_b64]
+                        self.status_update.emit(
+                            f"File {file_name_for_error} trovato nella cache."
+                        )
                         logging.info(
                             f"File {file_name_for_error} already exists in Gemini (cache hit): {existing_file.name}"
                         )
@@ -137,6 +149,9 @@ class ProcessingThread(QThread):
                         cache_hits += 1
                     else:
                         # Upload new file
+                        self.status_update.emit(
+                            f"Caricamento di {file_name_for_error} ({index + 1}/{num_files})..."
+                        )
                         logging.info(f"Uploading new file: {file_name_for_error}...")
                         gemini_file = self.gemini_client.files.upload(file=file_path)
                         gemini_contents.append(gemini_file)
@@ -161,16 +176,18 @@ class ProcessingThread(QThread):
                 f"File processing summary: {cache_hits} cached, {new_uploads} newly uploaded"
             )
 
+            self.status_update.emit("Gemini macina...")
             logging.info("All files uploaded. Requesting generation from Gemini...")
-            self.progress_update.emit(90)
+            self.progress_update.emit(50)
 
             # No more conditional logic. The user's prompt dictates the entire task.
             response = self.gemini_client.models.generate_content(
-                model="gemini-1.5-flash",  # Using 1.5-flash as it's great for this
+                model="gemini-2.5-flash",
                 contents=gemini_contents,
             )
             result_text = response.text
 
+            self.status_update.emit("Risposta ricevuta. Finalizzazione...")
             logging.info("Received response from Gemini.")
             self.progress_update.emit(95)
 
@@ -185,27 +202,11 @@ class ProcessingThread(QThread):
             self.error_occurred.emit(error_message, file_name_for_error)
             self.progress_update.emit(0)
         finally:
-            # Clean up only newly uploaded files, not cached ones
+            # Files are preserved on Gemini for future use
+            # they last 48h and it's free so no need to delete them
             logging.info(
-                f"Cleaning up {len(newly_uploaded_files)} newly uploaded Gemini files..."
+                "Processing completed. All files preserved for future use (48h)."
             )
-            for gemini_file in newly_uploaded_files:
-                try:
-                    self.gemini_client.files.delete(file=gemini_file)
-                    logging.info(f"Deleted remote file from Gemini: {gemini_file.name}")
-                except Exception as e:
-                    logging.warning(
-                        f"Could not delete Gemini file {gemini_file.name}: {e}"
-                    )
-
-            if len(newly_uploaded_files) == 0:
-                logging.info(
-                    "No newly uploaded files to clean up (all files were cached)"
-                )
-            else:
-                logging.info(
-                    "Cleanup completed. Cached files were preserved for future use."
-                )
         logging.info("Processing thread run method completed.")
 
 
@@ -442,7 +443,7 @@ class AudioSummaryApp(QWidget):
             )
             return
 
-        self.status_label.setText("Elaborazione in corso...")
+        self.status_label.setText("Avvio del processo...")
         self.process_button.setEnabled(False)
         self.user_prompt_text_edit.setEnabled(False)  # Disable prompt during processing
         self.progress_bar.setValue(0)
@@ -460,6 +461,7 @@ class AudioSummaryApp(QWidget):
         self.processing_thread.processing_finished.connect(self.display_result)
         self.processing_thread.error_occurred.connect(self.display_error)
         self.processing_thread.progress_update.connect(self.update_progress)
+        self.processing_thread.status_update.connect(self.update_status)
         self.processing_thread.start()
         logging.info("Processing thread started.")
 
@@ -538,6 +540,10 @@ class AudioSummaryApp(QWidget):
     def update_progress(self, progress_value):
         self.progress_bar.setValue(progress_value)
         logging.debug(f"Progress bar updated to: {progress_value}%")
+
+    def update_status(self, message):
+        """Updates the status label with a message from the processing thread."""
+        self.status_label.setText(message)
 
 
 if __name__ == "__main__":
