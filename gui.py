@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 
+import base64
+import glob
 import hashlib
 import logging
 import os
+import subprocess
 import sys
-import base64
+import tempfile
 
 import mistune
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from openai import OpenAI
 from PyQt6.QtCore import QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -31,6 +37,17 @@ logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+
+OPENAI_TRANSCRIBE_MODEL = "gpt-transcribe"
+# Formats accepted by the OpenAI Transcriptions API; anything else is converted with ffmpeg
+OPENAI_SUPPORTED_EXTENSIONS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"}
+OPENAI_MAX_FILE_BYTES = 24 * 1024 * 1024  # API limit is 25 MB, keep a small margin
+OPENAI_CHUNK_SECONDS = 30 * 60  # ~7 MB per chunk at 32 kbps
+
+BACKEND_GEMINI = "gemini"
+BACKEND_OPENAI = "openai"
+
 
 def calculate_sha256(file_path):
     """Calculate SHA-256 hash of a file."""
@@ -42,6 +59,39 @@ def calculate_sha256(file_path):
     return sha256_hash.hexdigest()
 
 
+class FollowUpThread(QThread):
+    """
+    Thread to handle follow-up audio queries using the established Gemini chat session.
+    """
+
+    followup_finished = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    progress_update = pyqtSignal(int)
+    status_update = pyqtSignal(str)
+
+    def __init__(self, chat_session, user_text):
+        super().__init__()
+        self.chat_session = chat_session
+        self.user_text = user_text
+
+    def run(self):
+        logging.info("FollowUpThread started.")
+        try:
+            self.progress_update.emit(25)
+            self.status_update.emit("Invio follow-up in corso...")
+            response = self.chat_session.send_message(self.user_text)
+            self.progress_update.emit(95)
+            self.status_update.emit("Risposta ricevuta.")
+            self.followup_finished.emit(response.text)
+            self.progress_update.emit(100)
+            logging.info("FollowUpThread finished successfully.")
+        except Exception as e:
+            error_message = f"Error sending follow-up: {e}"
+            logging.error(error_message, exc_info=True)
+            self.error_occurred.emit(error_message)
+            self.progress_update.emit(0)
+
+
 class ProcessingThread(QThread):
     """
     Thread to handle audio processing using the Gemini API.
@@ -49,7 +99,7 @@ class ProcessingThread(QThread):
     which can handle transcription, summarization, or other tasks in one call.
     """
 
-    processing_finished = pyqtSignal(str)
+    processing_finished = pyqtSignal(str, object)
     error_occurred = pyqtSignal(str, str)
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
@@ -58,12 +108,14 @@ class ProcessingThread(QThread):
         self,
         audio_file_paths,
         gemini_api_key,
+        gemini_model,
         user_prompt,
         enable_search=False,
     ):
         super().__init__()
         self.audio_file_paths = audio_file_paths
         self.gemini_api_key = gemini_api_key
+        self.gemini_model = gemini_model
         self.user_prompt = user_prompt
         self.enable_search = enable_search
 
@@ -198,19 +250,20 @@ class ProcessingThread(QThread):
             else:
                 logging.info("Grounding with Google Search is DISABLED.")
 
-            # Esegui la chiamata a Gemini, includendo la configurazione se presente
-            response = self.gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=gemini_contents,
+            # Crea la sessione chat con la configurazione se presente
+            chat_session = self.gemini_client.chats.create(
+                model=self.gemini_model,
                 config=content_config,
             )
+            # Esegui la chiamata a Gemini inviando primo messaggio col le clip
+            response = chat_session.send_message(gemini_contents)
             result_text = response.text
 
             self.status_update.emit("Risposta ricevuta. Finalizzazione...")
             logging.info("Received response from Gemini.")
             self.progress_update.emit(95)
 
-            self.processing_finished.emit(result_text)
+            self.processing_finished.emit(result_text, chat_session)
 
             self.progress_update.emit(100)
             logging.info("Processing thread finished successfully.")
@@ -229,9 +282,155 @@ class ProcessingThread(QThread):
         logging.info("Processing thread run method completed.")
 
 
+def run_ffmpeg(args):
+    """Run ffmpeg with the given arguments, raising a readable error on failure."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg non trovato: installalo per convertire l'audio.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg ha fallito: {e.stderr.strip()[-500:]}")
+
+
+class TranscriptionThread(QThread):
+    """
+    Thread to handle audio transcription using the OpenAI Transcriptions API.
+    Unsupported or too large files are converted to compact mp3 and split into chunks.
+    """
+
+    processing_finished = pyqtSignal(str, object)
+    error_occurred = pyqtSignal(str, str)
+    progress_update = pyqtSignal(int)
+    status_update = pyqtSignal(str)
+
+    def __init__(self, audio_file_paths, openai_api_key, context_prompt):
+        super().__init__()
+        self.audio_file_paths = audio_file_paths
+        self.openai_api_key = openai_api_key
+        self.context_prompt = context_prompt
+
+    def prepare_audio(self, file_path, index, work_dir):
+        """Return the list of files to send to the API for this audio file."""
+        ext = os.path.splitext(file_path)[1].lower()
+        if (
+            ext in OPENAI_SUPPORTED_EXTENSIONS
+            and os.path.getsize(file_path) <= OPENAI_MAX_FILE_BYTES
+        ):
+            return [file_path]
+
+        # Mono 16 kHz 32 kbps mp3 is plenty for speech and keeps files small
+        converted_path = os.path.join(work_dir, f"file{index}.mp3")
+        logging.info(f"Converting {file_path} to {converted_path}...")
+        run_ffmpeg(
+            ["-i", file_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", converted_path]
+        )
+        if os.path.getsize(converted_path) <= OPENAI_MAX_FILE_BYTES:
+            return [converted_path]
+
+        logging.info(f"{converted_path} still too large, splitting into chunks...")
+        chunk_pattern = os.path.join(work_dir, f"file{index}_chunk%03d.mp3")
+        run_ffmpeg(
+            [
+                "-i",
+                converted_path,
+                "-f",
+                "segment",
+                "-segment_time",
+                str(OPENAI_CHUNK_SECONDS),
+                "-reset_timestamps",
+                "1",
+                "-c",
+                "copy",
+                chunk_pattern,
+            ]
+        )
+        return sorted(glob.glob(os.path.join(work_dir, f"file{index}_chunk*.mp3")))
+
+    def run(self):
+        logging.info("Transcription thread started.")
+        file_name_for_error = "audio files"
+
+        try:
+            if not self.openai_api_key:
+                raise ValueError("OPENAI_API_KEY is not set in the .env file")
+
+            self.status_update.emit("Inizializzazione client OpenAI...")
+            client = OpenAI(api_key=self.openai_api_key)
+            self.progress_update.emit(5)
+
+            extra_args = {}
+            if self.context_prompt:
+                extra_args["prompt"] = self.context_prompt
+
+            num_files = len(self.audio_file_paths)
+            sections = []
+
+            with tempfile.TemporaryDirectory() as work_dir:
+                for index, file_path in enumerate(self.audio_file_paths):
+                    file_name_for_error = os.path.basename(file_path)
+                    self.progress_update.emit(5 + int((90 / num_files) * index))
+
+                    self.status_update.emit(
+                        f"File {index + 1}/{num_files}: preparazione di {file_name_for_error}..."
+                    )
+                    chunk_paths = self.prepare_audio(file_path, index, work_dir)
+
+                    chunk_texts = []
+                    for chunk_index, chunk_path in enumerate(chunk_paths):
+                        self.status_update.emit(
+                            f"File {index + 1}/{num_files}: trascrizione di {file_name_for_error}"
+                            f" (parte {chunk_index + 1}/{len(chunk_paths)})..."
+                        )
+                        logging.info(f"Transcribing {chunk_path}...")
+                        with open(chunk_path, "rb") as audio_file:
+                            transcription = client.audio.transcriptions.create(
+                                model=OPENAI_TRANSCRIBE_MODEL,
+                                file=audio_file,
+                                **extra_args,
+                            )
+                        chunk_texts.append(transcription.text.strip())
+
+                    text = "\n\n".join(chunk_texts)
+                    if num_files > 1:
+                        text = f"## {file_name_for_error}\n\n{text}"
+                    sections.append(text)
+
+            self.status_update.emit("Trascrizione completata. Finalizzazione...")
+            self.progress_update.emit(95)
+            # No chat session: follow-up is not available for plain transcription
+            self.processing_finished.emit("\n\n".join(sections), None)
+            self.progress_update.emit(100)
+            logging.info("Transcription thread finished successfully.")
+
+        except Exception as e:
+            error_message = f"Error transcribing {file_name_for_error}: {e}"
+            logging.error(error_message, exc_info=True)
+            self.error_occurred.emit(error_message, file_name_for_error)
+            self.progress_update.emit(0)
+
+
 class AudioSummaryApp(QWidget):
 
     DEFAULT_PROMPT = "Esegui una trascrizione e riassunto dei file audio forniti."
+
+    # backend -> (settings key, default prompt, label)
+    PROMPT_SETTINGS = {
+        BACKEND_GEMINI: (
+            "userPrompt",
+            DEFAULT_PROMPT,
+            "Prompt per Gemini (cosa fare con l'audio?):",
+        ),
+        BACKEND_OPENAI: (
+            "transcribePrompt",
+            "",
+            "Contesto per la trascrizione (opzionale: argomento, nomi, termini tecnici):",
+        ),
+    }
 
     def __init__(self):
         logging.info("AudioSummaryApp initialization started.")
@@ -240,11 +439,16 @@ class AudioSummaryApp(QWidget):
         self.setGeometry(100, 100, 1300, 1000)
 
         self.gemini_api_key = None
+        self.openai_api_key = None
         self.load_api_key()
         self.processing_thread = None
         self.audio_file_paths = []
         self.last_result_text = ""
         self.result_is_unsaved = False
+
+        self.chat_session = None
+        self.full_chat_markdown = ""
+
         self.settings = QSettings("BitreyDev", "AudioSummaryApp")
 
         self.init_ui()
@@ -295,6 +499,9 @@ class AudioSummaryApp(QWidget):
                 color: #666666;
                 border: 1px solid #444444;
             }
+            QFrame[frameShape="4"] {
+                color: #555555;
+            }
             QProgressBar {
                 background-color: #444444;
                 color: #ffffff;
@@ -314,6 +521,22 @@ class AudioSummaryApp(QWidget):
                 background-color: #2a2a2a;
                 border: 1px solid #444444;
             }
+            QComboBox {
+                background-color: #555555;
+                color: #ffffff;
+                border: 1px solid #666666;
+                padding: 4px;
+                border-radius: 3px;
+            }
+            QComboBox:disabled {
+                background-color: #3a3a3a;
+                color: #666666;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #444444;
+                color: #ffffff;
+                selection-background-color: #6a994e;
+            }
         """
         )
         logging.info("Dark theme applied.")
@@ -332,6 +555,13 @@ class AudioSummaryApp(QWidget):
             )
         else:
             logging.info("GEMINI_API_KEY loaded successfully.")
+
+        self.gemini_model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        logging.info(f"Using Gemini model: {self.gemini_model}")
+
+        # Only needed for transcription with OpenAI, checked when processing starts
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+
         logging.info("API keys loading process completed.")
 
     def init_ui(self):
@@ -351,11 +581,22 @@ class AudioSummaryApp(QWidget):
 
         self.layout.addLayout(file_selection_layout)
 
-        self.prompt_label = QLabel("Prompt per Gemini (cosa fare con l'audio?):", self)
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Modello:", self))
+        self.model_combo = QComboBox(self)
+        self.model_combo.addItem(
+            f"Gemini ({self.gemini_model}) - analisi, riassunto, domande", BACKEND_GEMINI
+        )
+        self.model_combo.addItem(
+            f"OpenAI ({OPENAI_TRANSCRIBE_MODEL}) - trascrizione fedele", BACKEND_OPENAI
+        )
+        model_layout.addWidget(self.model_combo, 1)
+        self.layout.addLayout(model_layout)
+
+        self.prompt_label = QLabel("", self)
         self.layout.addWidget(self.prompt_label)
         self.user_prompt_text_edit = QTextEdit(self)
         self.user_prompt_text_edit.setFixedHeight(180)
-        self.user_prompt_text_edit.textChanged.connect(self.save_settings)
         self.layout.addWidget(self.user_prompt_text_edit)
 
         # Aggiungi la checkbox per la ricerca Google
@@ -380,6 +621,31 @@ class AudioSummaryApp(QWidget):
         self.output_text_edit.setReadOnly(True)
         self.layout.addWidget(self.output_text_edit)
 
+        # Added Follow-up UI
+        self.separator = QFrame(self)
+        self.separator.setFrameShape(QFrame.Shape.HLine)
+        self.separator.setFrameShadow(QFrame.Shadow.Sunken)
+        self.layout.addWidget(self.separator)
+
+        self.followup_label = QLabel("Continua la conversazione:", self)
+        self.layout.addWidget(self.followup_label)
+
+        followup_layout = QHBoxLayout()
+        self.followup_input = QTextEdit(self)
+        self.followup_input.setFixedHeight(70)
+        self.followup_input.setPlaceholderText(
+            "Es: fammi un riassunto ancora più breve..."
+        )
+        self.followup_input.setEnabled(False)
+        followup_layout.addWidget(self.followup_input)
+
+        self.followup_button = QPushButton("Invia continuo", self)
+        self.followup_button.setEnabled(False)
+        self.followup_button.clicked.connect(self.send_followup)
+        followup_layout.addWidget(self.followup_button)
+
+        self.layout.addLayout(followup_layout)
+
         self.status_label = QLabel("", self)
         self.layout.addWidget(self.status_label)
 
@@ -390,22 +656,61 @@ class AudioSummaryApp(QWidget):
 
         logging.info("User interface initialized.")
 
+    def current_backend(self):
+        return self.model_combo.currentData()
+
     def load_settings(self):
         logging.info("Loading settings from QSettings.")
-        self.user_prompt_text_edit.textChanged.disconnect()
-        saved_prompt = self.settings.value("userPrompt", self.DEFAULT_PROMPT)
-        self.user_prompt_text_edit.setPlainText(saved_prompt)
+        saved_backend = self.settings.value("selectedBackend", BACKEND_GEMINI)
+        backend_index = self.model_combo.findData(saved_backend)
+        self.model_combo.setCurrentIndex(max(backend_index, 0))
+        self.apply_backend_ui()
+        self.model_combo.currentIndexChanged.connect(self.on_model_changed)
         self.user_prompt_text_edit.textChanged.connect(self.save_settings)
+
+        saved_response = self.settings.value("lastResponseMarkdown", "")
+        if saved_response:
+            self.full_chat_markdown = saved_response
+            self.last_result_text = saved_response
+            self.result_is_unsaved = False
+            self.output_text_edit.setHtml(mistune.html(saved_response))
         logging.info("Settings loaded.")
+
+    def apply_backend_ui(self):
+        """Show the prompt and options that belong to the selected backend."""
+        settings_key, default_prompt, label = self.PROMPT_SETTINGS[self.current_backend()]
+        self.prompt_label.setText(label)
+        self.user_prompt_text_edit.blockSignals(True)
+        self.user_prompt_text_edit.setPlainText(
+            self.settings.value(settings_key, default_prompt)
+        )
+        self.user_prompt_text_edit.blockSignals(False)
+        self.user_prompt_text_edit.setPlaceholderText(
+            "Es: lezione di analisi 2, prof. Rossi, teorema di Lagrange"
+            if self.current_backend() == BACKEND_OPENAI
+            else ""
+        )
+        self.search_checkbox.setEnabled(self.current_backend() == BACKEND_GEMINI)
+
+    def on_model_changed(self):
+        logging.info(f"Selected backend: {self.current_backend()}")
+        self.settings.setValue("selectedBackend", self.current_backend())
+        self.apply_backend_ui()
 
     def save_settings(self):
         logging.info("Saving settings to QSettings.")
-        self.settings.setValue("userPrompt", self.user_prompt_text_edit.toPlainText())
+        settings_key = self.PROMPT_SETTINGS[self.current_backend()][0]
+        self.settings.setValue(settings_key, self.user_prompt_text_edit.toPlainText())
         logging.info("Settings saved.")
+
+    def save_cached_response(self):
+        self.settings.setValue("lastResponseMarkdown", self.full_chat_markdown)
 
     def reset_prompt(self):
         logging.info("Resetting prompt to default.")
-        self.user_prompt_text_edit.setPlainText(self.DEFAULT_PROMPT)
+        self.user_prompt_text_edit.setPlainText(
+            self.PROMPT_SETTINGS[self.current_backend()][1]
+        )
         self.save_settings()
         logging.info("Prompt reset to default.")
 
@@ -459,11 +764,18 @@ class AudioSummaryApp(QWidget):
             )
             return
 
-        if not self.gemini_api_key:
+        backend = self.current_backend()
+        required_key = (
+            "OPENAI_API_KEY" if backend == BACKEND_OPENAI else "GEMINI_API_KEY"
+        )
+        api_key = (
+            self.openai_api_key if backend == BACKEND_OPENAI else self.gemini_api_key
+        )
+        if not api_key:
             QMessageBox.warning(
                 self,
                 "Chiave API mancante",
-                "Imposta GEMINI_API_KEY nel tuo file .env e riavvia.",
+                f"Imposta {required_key} nel tuo file .env e riavvia.",
             )
             return
 
@@ -471,6 +783,12 @@ class AudioSummaryApp(QWidget):
         self.process_button.setEnabled(False)
         self.user_prompt_text_edit.setEnabled(False)  # Disable prompt during processing
         self.search_checkbox.setEnabled(False)  # Disabilita anche la checkbox
+        self.model_combo.setEnabled(False)
+        self.followup_input.setEnabled(False)
+        self.followup_button.setEnabled(False)
+        self.chat_session = None
+        self.full_chat_markdown = ""
+
         self.progress_bar.setValue(0)
         self.output_text_edit.clear()
 
@@ -481,12 +799,20 @@ class AudioSummaryApp(QWidget):
 
         logging.info("Creating and starting processing thread.")
 
-        self.processing_thread = ProcessingThread(
-            self.audio_file_paths,
-            self.gemini_api_key,
-            user_prompt,
-            enable_search=use_google_search,
-        )
+        if backend == BACKEND_OPENAI:
+            self.processing_thread = TranscriptionThread(
+                self.audio_file_paths,
+                self.openai_api_key,
+                user_prompt.strip(),
+            )
+        else:
+            self.processing_thread = ProcessingThread(
+                self.audio_file_paths,
+                self.gemini_api_key,
+                self.gemini_model,
+                user_prompt,
+                enable_search=use_google_search,
+            )
         self.processing_thread.processing_finished.connect(self.display_result)
         self.processing_thread.error_occurred.connect(self.display_error)
         self.processing_thread.progress_update.connect(self.update_progress)
@@ -494,30 +820,90 @@ class AudioSummaryApp(QWidget):
         self.processing_thread.start()
         logging.info("Processing thread started.")
 
-    def display_result(self, result_text):
-        logging.info("Displaying result from Gemini.")
+    def display_result(self, result_text, chat_session):
+        logging.info("Displaying processing result.")
 
-        html_content = mistune.html(result_text)
+        self.chat_session = chat_session
+        self.full_chat_markdown = result_text
+
+        html_content = mistune.html(self.full_chat_markdown)
         self.output_text_edit.setHtml(html_content)
 
         self.status_label.setText("Finito!!")
         self.process_button.setEnabled(True)
         self.user_prompt_text_edit.setEnabled(True)
-        self.search_checkbox.setEnabled(True)  # Riattiva la checkbox
+        self.model_combo.setEnabled(True)
+        self.search_checkbox.setEnabled(self.current_backend() == BACKEND_GEMINI)
+
+        # Abilita box di followup (solo con Gemini, che ha una sessione chat)
+        self.followup_input.setEnabled(chat_session is not None)
+        self.followup_button.setEnabled(chat_session is not None)
+
         self.progress_bar.setValue(100)
 
         # Store result for saving
-        self.last_result_text = result_text
+        self.last_result_text = self.full_chat_markdown
         self.result_is_unsaved = bool(result_text)
+        self.save_cached_response()
 
         self.prompt_save_file()
+
+    def send_followup(self):
+        follow_up_text = self.followup_input.toPlainText().strip()
+        if not follow_up_text or not self.chat_session:
+            return
+
+        self.followup_input.setEnabled(False)
+        self.followup_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+
+        self.followup_thread = FollowUpThread(self.chat_session, follow_up_text)
+        self.followup_thread.followup_finished.connect(
+            lambda text: self.display_followup(follow_up_text, text)
+        )
+        self.followup_thread.error_occurred.connect(self.display_followup_error)
+        self.followup_thread.progress_update.connect(self.update_progress)
+        self.followup_thread.status_update.connect(self.update_status)
+        self.followup_thread.start()
+
+    def display_followup(self, _user_text, result_text):
+        self.full_chat_markdown += f"\n\n---\n\n{result_text}"
+
+        html_content = mistune.html(self.full_chat_markdown)
+        self.output_text_edit.setHtml(html_content)
+
+        self.status_label.setText("Finito!!")
+        self.followup_input.clear()
+        self.followup_input.setEnabled(True)
+        self.followup_button.setEnabled(True)
+        self.progress_bar.setValue(100)
+
+        self.last_result_text = self.full_chat_markdown
+        self.result_is_unsaved = True
+        self.save_cached_response()
+
+        # Scorri in basso
+        scroll_bar = self.output_text_edit.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def display_followup_error(self, error_message):
+        logging.error(f"Error in follow-up: {error_message}")
+        QMessageBox.critical(self, "Errore di elaborazione", error_message)
+        self.status_label.setText("Errore durante il follow-up.")
+        self.followup_input.setEnabled(True)
+        self.followup_button.setEnabled(True)
+        self.progress_bar.setValue(0)
         logging.info("Result displayed and UI updated.")
 
     def prompt_save_file(self):
         if not self.last_result_text:
             return
 
-        default_suffix = "summary.md"
+        default_suffix = (
+            "transcription.md"
+            if self.current_backend() == BACKEND_OPENAI
+            else "summary.md"
+        )
         file_filter = "Markdown Files (*.md)"
         dialog_title = "Salva riassunto/trascrizione come Markdown"
         content_to_save = self.last_result_text
@@ -564,7 +950,9 @@ class AudioSummaryApp(QWidget):
         self.status_label.setText(f"Errore durante l'elaborazione di {file_name}.")
         self.process_button.setEnabled(True)
         self.user_prompt_text_edit.setEnabled(True)
-        self.search_checkbox.setEnabled(True)  # Riattiva la checkbox
+        self.model_combo.setEnabled(True)
+        self.search_checkbox.setEnabled(self.current_backend() == BACKEND_GEMINI)
+        # Il follow up rimane disabilitato perche' la chat non e' pronta
         self.progress_bar.setValue(0)
         logging.error(f"Error displayed in UI for file: {file_name}")
 
