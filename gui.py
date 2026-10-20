@@ -213,6 +213,132 @@ def format_cost(cost):
     return f"${cost:.4f}" if 0 < cost < 0.01 else f"${cost:.2f}"
 
 
+FENCE_PATTERN = re.compile(r"^\s*(```|~~~)", re.MULTILINE)
+# A link or image still being written at the end, e.g. "[testo](https://exa"
+PARTIAL_LINK_PATTERN = re.compile(r"(!?)\[([^\]\n]*)\]\([^)\s]*$")
+# Escapes and inline Markdown markers, longest first
+INLINE_TOKEN_PATTERN = re.compile(r"\\.|`|\*\*|__|~~|\*|_")
+
+
+TABLE_SEPARATOR_CELL = re.compile(r"\s*:?-+:?\s*")
+TABLE_SEPARATOR_LINE = re.compile(r"[\s|:\-]+")
+
+
+def table_cells(line):
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|"):
+        line = line[:-1]
+    return line.split("|")
+
+
+def heal_partial_table(tail):
+    """
+    Complete a table still being written at the end of a paragraph: mistune renders
+    nothing as a table until the separator row is complete and every row is closed.
+    """
+    # A row that was just finished leaves a trailing newline
+    body = tail.rstrip("\n")
+    trailing = tail[len(body) :]
+    lines = body.split("\n")
+    start = len(lines)
+    while start and lines[start - 1].lstrip().startswith("|"):
+        start -= 1
+    table = lines[start:]
+    if not table or not any(c.strip() for c in table_cells(table[0])):
+        return tail
+
+    columns = len(table_cells(table[0]))
+    table[0] = "|" + "|".join(table_cells(table[0])) + "|"
+    separator = table_cells(table[1]) if len(table) > 1 else []
+    separator_complete = len(separator) == columns and all(
+        TABLE_SEPARATOR_CELL.fullmatch(c) for c in separator
+    )
+    if not separator_complete and (
+        len(table) > 2
+        or (len(table) == 2 and not TABLE_SEPARATOR_LINE.fullmatch(table[1]))
+    ):
+        return tail  # Not a table
+    # Keep the alignments already written and fill in the rest
+    cells = [c if TABLE_SEPARATOR_CELL.fullmatch(c) else "---" for c in separator]
+    cells += ["---"] * (columns - len(cells))
+    table[1:2] = ["|" + "|".join(cells[:columns]) + "|"]
+    if len(table) > 2:
+        # The last row may be cut in the middle of a cell
+        cells = table_cells(table[-1])[:columns]
+        cells += [" "] * (columns - len(cells))
+        table[-1] = "|" + "|".join(cells) + "|"
+    return "\n".join(lines[:start] + table) + trailing
+
+
+def heal_partial_markdown(text):
+    """
+    Close the inline Markdown left open at the end of a streamed text, so that
+    "ciao **prov" renders as bold while the rest is still arriving (like Vercel's
+    remend). Only the last paragraph is touched; never use it on final text.
+    """
+    # mistune already renders an unclosed code block correctly
+    if len(FENCE_PATTERN.findall(text)) % 2:
+        return text
+
+    split_at = text.rfind("\n\n") + 1
+    head, tail = text[:split_at], text[split_at:]
+
+    # Show a half-written link as its text and drop a half-written image
+    tail = PARTIAL_LINK_PATTERN.sub(lambda m: "" if m.group(1) else m.group(2), tail)
+
+    open_markers = []
+    skip_until = 0
+    for match in INLINE_TOKEN_PATTERN.finditer(tail):
+        token, i = match.group(), match.start()
+        if i < skip_until or token.startswith("\\"):
+            continue
+        in_code = bool(open_markers) and open_markers[-1] == "`"
+        if token == "`":
+            if in_code:
+                open_markers.pop()
+            else:
+                open_markers.append(token)
+            continue
+        if in_code:
+            continue  # Markers inside inline code are literal
+
+        line_start = tail.rfind("\n", 0, i) + 1
+        if not tail[line_start:i].strip():
+            line_end = tail.find("\n", i)
+            line = tail[i : line_end if line_end >= 0 else len(tail)].strip()
+            # Rules like "***" and list bullets like "* voce" aren't emphasis
+            if len(line) >= 3 and set(line) <= {token[0]}:
+                skip_until = line_end if line_end >= 0 else len(tail)
+                continue
+            if token == "*" and tail[i + 1 : i + 2] == " ":
+                continue
+
+        before = tail[i - 1] if i else " "
+        after = tail[match.end() : match.end() + 1]
+        # snake_case isn't emphasis
+        if token[0] == "_" and before.isalnum() and after.isalnum():
+            continue
+        if token in open_markers:
+            # Close the innermost matching marker
+            del open_markers[len(open_markers) - 1 - open_markers[::-1].index(token)]
+        elif not after:
+            # A marker at the very end has no text yet: hide it
+            tail = tail[:i]
+            break
+        elif not after.isspace():
+            open_markers.append(token)
+
+    # Markers opened right before the hidden one have no text either
+    while open_markers and tail.endswith(open_markers[-1]):
+        tail = tail[: -len(open_markers.pop())]
+    if open_markers:
+        tail = tail.rstrip(" ")
+    tail += "".join(reversed(open_markers))
+    return head + heal_partial_table(tail)
+
+
 def stream_gemini_message(chat_session, message, on_text):
     """
     Send a chat message with streaming, calling on_text with the text received so far.
@@ -1395,7 +1521,9 @@ class AudioSummaryApp(QWidget):
         scroll_bar = self.output_text_edit.verticalScrollBar()
         # Follow the new text only if the user hasn't scrolled up
         at_bottom = scroll_bar.value() >= scroll_bar.maximum() - 20
-        self.output_text_edit.setHtml(mistune.html(self.pending_markdown))
+        self.output_text_edit.setHtml(
+            mistune.html(heal_partial_markdown(self.pending_markdown))
+        )
         self.pending_markdown = None
         if at_bottom:
             scroll_bar.setValue(scroll_bar.maximum())
