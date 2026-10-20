@@ -2,6 +2,7 @@
 
 import base64
 import glob
+from datetime import date
 import hashlib
 import json
 import logging
@@ -54,6 +55,7 @@ OPENAI_MODELS = {
     "gpt-transcribe": {
         "prompt": True,
         "max_seconds": None,
+        "price": {"per_minute": 0.0045},
         "info": "Modello consigliato da OpenAI per trascrivere registrazioni nella "
         "lingua originale. Il prompt fa da contesto (argomento, nomi, termini tecnici)."
         "<br><br>Prezzo: $0.0045 al minuto (un'ora costa circa $0.27).",
@@ -62,6 +64,7 @@ OPENAI_MODELS = {
         "prompt": False,
         "diarize": True,
         "max_seconds": GPT4O_MAX_SECONDS,
+        "price": {"input": 2.50, "output": 10.00, "per_minute": 0.006},
         "info": "Riconosce chi parla ed etichetta ogni intervento (A, B, ...). "
         "Da usare solo se servono gli speaker. Non accetta prompt. Se il file viene "
         "diviso in parti, le etichette ripartono da capo in ogni parte."
@@ -71,6 +74,7 @@ OPENAI_MODELS = {
     "whisper-1": {
         "prompt": True,
         "max_seconds": None,
+        "price": {"per_minute": 0.006},
         "info": "Il modello Whisper originale. Il prompt è limitato a 224 token e viene "
         "seguito meno bene. Nell'API offre anche timestamp, sottotitoli e traduzione "
         "in inglese, che questa app non usa.<br><br>Prezzo: $0.006 al minuto "
@@ -79,6 +83,7 @@ OPENAI_MODELS = {
     "gpt-4o-transcribe": {
         "prompt": True,
         "max_seconds": GPT4O_MAX_SECONDS,
+        "price": {"input": 2.50, "output": 10.00, "per_minute": 0.006},
         "info": "Trascrizione basata su GPT-4o. Supporta il prompt. OpenAI lo mantiene "
         "per le integrazioni esistenti e consiglia gpt-transcribe per quelle nuove. "
         "In una prova con un dialogo a due voci ha saltato alcune frasi."
@@ -88,6 +93,7 @@ OPENAI_MODELS = {
     "gpt-4o-mini-transcribe": {
         "prompt": True,
         "max_seconds": GPT4O_MAX_SECONDS,
+        "price": {"input": 1.25, "output": 5.00, "per_minute": 0.003},
         "info": "Versione più economica di gpt-4o-transcribe. Supporta il prompt. "
         "OpenAI lo mantiene per le integrazioni esistenti e consiglia gpt-transcribe "
         "per quelle nuove. In una prova con un dialogo a due voci ha saltato alcune "
@@ -123,6 +129,83 @@ GEMINI_MODEL_INFO = {
     "<br><br>Prezzo: $2 in input e $10 in output per 1M token fino al 30/11/2026, "
     "poi $4 e $20.",
 }
+
+
+# Paid tier rates in USD per 1M tokens, as (valid until, rates); None = no end date
+GEMINI_PRICING = {
+    "gemini-3.8-flash": [
+        (date(2027, 1, 1), {"input": 0.75, "cached": 0.075, "output": 3.75}),
+        (None, {"input": 1.50, "cached": 0.15, "output": 7.50}),
+    ],
+    "gemini-3.5-transcribe": [
+        # Google's own blended estimate for this model is ~$0.005 per minute
+        (None, {"input": 2.00, "cached": 2.00, "output": 12.00, "per_minute": 0.005}),
+    ],
+    "gemini-4-argon": [
+        (date(2026, 12, 1), {"input": 2.00, "cached": 0.10, "output": 10.00}),
+        (None, {"input": 4.00, "cached": 0.20, "output": 20.00}),
+    ],
+}
+GEMINI_AUDIO_TOKENS_PER_SECOND = 32
+
+
+def gemini_rates(model_id):
+    """Return today's rates for a Gemini model, or None if its price is unknown."""
+    for valid_until, rates in GEMINI_PRICING.get(model_id, []):
+        if valid_until is None or date.today() < valid_until:
+            return rates
+    return None
+
+
+def gemini_cost(model_id, response):
+    """Return the cost in USD of a Gemini response, or None if unknown."""
+    rates = gemini_rates(model_id)
+    usage = response.usage_metadata
+    if not rates or not usage:
+        return None
+    prompt_tokens = usage.prompt_token_count or 0
+    cached_tokens = usage.cached_content_token_count or 0
+    # Thinking tokens are billed as output
+    output_tokens = (usage.candidates_token_count or 0) + (
+        usage.thoughts_token_count or 0
+    )
+    return (
+        (prompt_tokens - cached_tokens) * rates["input"]
+        + cached_tokens * rates["cached"]
+        + output_tokens * rates["output"]
+    ) / 1_000_000
+
+
+def openai_cost(model, usage, audio_path):
+    """Return the cost in USD of an OpenAI transcription."""
+    price = OPENAI_MODELS[model]["price"]
+    if usage is not None and usage.type == "tokens" and "input" in price:
+        return (
+            usage.input_tokens * price["input"] + usage.output_tokens * price["output"]
+        ) / 1_000_000
+    if usage is not None and usage.type == "duration":
+        seconds = usage.seconds
+    else:
+        seconds = get_audio_duration(audio_path) or 0
+    return seconds / 60 * price["per_minute"]
+
+
+def estimated_cost_per_minute(backend, model_id):
+    """Return the estimated cost of one minute of audio, or None if unknown."""
+    if backend == BACKEND_OPENAI:
+        return OPENAI_MODELS[model_id]["price"]["per_minute"]
+    rates = gemini_rates(model_id)
+    if not rates:
+        return None
+    # Only the audio input can be estimated in advance, the reply length is unknown
+    return rates.get("per_minute") or (
+        60 * GEMINI_AUDIO_TOKENS_PER_SECOND * rates["input"] / 1_000_000
+    )
+
+
+def format_cost(cost):
+    # Keep sub-cent amounts readable
+    return f"${cost:.4f}" if 0 < cost < 0.01 else f"${cost:.2f}"
 
 
 def is_gemini_transcribe_model(model_id):
@@ -190,10 +273,12 @@ class FollowUpThread(QThread):
     error_occurred = pyqtSignal(str)
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
+    cost_update = pyqtSignal(float)
 
-    def __init__(self, chat_session, user_text):
+    def __init__(self, chat_session, gemini_model, user_text):
         super().__init__()
         self.chat_session = chat_session
+        self.gemini_model = gemini_model
         self.user_text = user_text
 
     def run(self):
@@ -202,6 +287,10 @@ class FollowUpThread(QThread):
             self.progress_update.emit(25)
             self.status_update.emit("Invio follow-up in corso...")
             response = self.chat_session.send_message(self.user_text)
+            # The whole conversation, audio included, is sent again with each follow-up
+            cost = gemini_cost(self.gemini_model, response)
+            if cost is not None:
+                self.cost_update.emit(cost)
             self.progress_update.emit(95)
             self.status_update.emit("Risposta ricevuta.")
             self.followup_finished.emit(response_text(response))
@@ -225,6 +314,7 @@ class ProcessingThread(QThread):
     error_occurred = pyqtSignal(str, str)
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
+    cost_update = pyqtSignal(float)
 
     def __init__(
         self,
@@ -380,6 +470,9 @@ class ProcessingThread(QThread):
             # Esegui la chiamata a Gemini inviando primo messaggio col le clip
             response = chat_session.send_message(gemini_contents)
             result_text = response_text(response)
+            cost = gemini_cost(self.gemini_model, response)
+            if cost is not None:
+                self.cost_update.emit(cost)
 
             self.status_update.emit("Risposta ricevuta. Finalizzazione...")
             logging.info("Received response from Gemini.")
@@ -507,6 +600,7 @@ class TranscriptionThread(QThread):
     error_occurred = pyqtSignal(str, str)
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
+    cost_update = pyqtSignal(float)
 
     def __init__(self, audio_file_paths, openai_api_key, model, context_prompt):
         super().__init__()
@@ -562,6 +656,7 @@ class TranscriptionThread(QThread):
     def run(self):
         logging.info("Transcription thread started.")
         file_name_for_error = "audio files"
+        total_cost = 0.0
 
         try:
             if not self.openai_api_key:
@@ -604,6 +699,9 @@ class TranscriptionThread(QThread):
                                 file=audio_file,
                                 **extra_args,
                             )
+                        total_cost += openai_cost(
+                            self.model, transcription.usage, chunk_path
+                        )
                         if self.model_options.get("diarize"):
                             chunk_texts.append(
                                 format_diarized_segments(transcription.segments)
@@ -618,6 +716,7 @@ class TranscriptionThread(QThread):
 
             self.status_update.emit("Trascrizione completata. Finalizzazione...")
             self.progress_update.emit(95)
+            self.cost_update.emit(total_cost)
             # No chat session: follow-up is not available for plain transcription
             self.processing_finished.emit("\n\n".join(sections), None)
             self.progress_update.emit(100)
@@ -626,6 +725,9 @@ class TranscriptionThread(QThread):
         except Exception as e:
             error_message = f"Error transcribing {file_name_for_error}: {e}"
             logging.error(error_message, exc_info=True)
+            # Parts transcribed before the error are billed anyway
+            if total_cost:
+                self.cost_update.emit(total_cost)
             self.error_occurred.emit(error_message, file_name_for_error)
             self.progress_update.emit(0)
 
@@ -663,7 +765,10 @@ class AudioSummaryApp(QWidget):
         self.result_is_unsaved = False
 
         self.chat_session = None
+        self.chat_model = None
         self.full_chat_markdown = ""
+        self.audio_durations = {}  # file path -> seconds, for cost estimates
+        self.last_cost = None
 
         self.settings = QSettings("BitreyDev", "AudioSummaryApp")
 
@@ -875,8 +980,24 @@ class AudioSummaryApp(QWidget):
 
         self.layout.addLayout(followup_layout)
 
+        status_layout = QHBoxLayout()
         self.status_label = QLabel("", self)
-        self.layout.addWidget(self.status_label)
+        status_layout.addWidget(self.status_label, 1)
+
+        self.cost_label = QLabel("", self)
+        self.cost_label.setToolTip(
+            "Costi calcolati con i prezzi del paid tier. Nel free tier di Gemini "
+            "non paghi, e la ricerca Google è esclusa dal calcolo."
+        )
+        status_layout.addWidget(self.cost_label)
+
+        self.reset_cost_button = QToolButton(self)
+        self.reset_cost_button.setText("Azzera")
+        self.reset_cost_button.setToolTip("Azzera il totale speso")
+        self.reset_cost_button.clicked.connect(self.reset_total_cost)
+        status_layout.addWidget(self.reset_cost_button)
+
+        self.layout.addLayout(status_layout)
 
         self.setLayout(self.layout)
 
@@ -974,6 +1095,7 @@ class AudioSummaryApp(QWidget):
         self.settings.setValue("geminiModels", json.dumps(models))
         self.populate_model_combo()
         self.apply_backend_ui()
+        self.update_cost_label()
 
     def load_settings(self):
         logging.info("Loading settings from QSettings.")
@@ -982,6 +1104,7 @@ class AudioSummaryApp(QWidget):
         self.apply_backend_ui()
         self.model_combo.currentIndexChanged.connect(self.on_model_changed)
         self.user_prompt_text_edit.textChanged.connect(self.save_settings)
+        self.update_cost_label()
 
         saved_response = self.settings.value("lastResponseMarkdown", "")
         if saved_response:
@@ -1026,6 +1149,41 @@ class AudioSummaryApp(QWidget):
         logging.info(f"Selected model: {self.model_combo.currentData()}")
         self.settings.setValue("selectedModel", self.model_combo.currentData())
         self.apply_backend_ui()
+        self.update_cost_label()
+
+    def update_cost_label(self):
+        """Show the estimate for the selected files, the last cost and the total."""
+        parts = []
+        per_minute = estimated_cost_per_minute(
+            self.current_backend(), self.current_model()
+        )
+        if self.audio_file_paths and per_minute is not None:
+            for path in self.audio_file_paths:
+                if path not in self.audio_durations:
+                    self.audio_durations[path] = get_audio_duration(path) or 0
+            minutes = sum(self.audio_durations[p] for p in self.audio_file_paths) / 60
+            estimate = f"Stima: ~{format_cost(minutes * per_minute)}"
+            if self.current_backend() == BACKEND_GEMINI and not gemini_rates(
+                self.current_model()
+            ).get("per_minute"):
+                estimate += " + risposta"
+            parts.append(estimate)
+        if self.last_cost is not None:
+            parts.append(f"Ultima: {format_cost(self.last_cost)}")
+        total = float(self.settings.value("totalCost", 0.0))
+        parts.append(f"Totale: {format_cost(total)}")
+        self.cost_label.setText(" · ".join(parts))
+
+    def add_cost(self, cost):
+        logging.info(f"Request cost: {format_cost(cost)}")
+        self.last_cost = (self.last_cost or 0) + cost
+        total = float(self.settings.value("totalCost", 0.0)) + cost
+        self.settings.setValue("totalCost", total)
+        self.update_cost_label()
+
+    def reset_total_cost(self):
+        self.settings.setValue("totalCost", 0.0)
+        self.update_cost_label()
 
     def save_settings(self):
         logging.info("Saving settings to QSettings.")
@@ -1076,6 +1234,7 @@ class AudioSummaryApp(QWidget):
                 display_text = f"{len(self.audio_file_paths)} file selezionati"
 
             self.file_path_label.setText(display_text)
+            self.update_cost_label()
             self.process_button.setEnabled(True)
             self.output_text_edit.clear()
             self.status_label.clear()
@@ -1083,6 +1242,7 @@ class AudioSummaryApp(QWidget):
             self.file_path_label.setText("Nessun file audio selezionato")
             self.process_button.setEnabled(False)
             self.audio_file_paths = []
+            self.update_cost_label()
             logging.info("No audio file selected.")
 
     def start_processing(self):
@@ -1117,7 +1277,9 @@ class AudioSummaryApp(QWidget):
         self.followup_input.setEnabled(False)
         self.followup_button.setEnabled(False)
         self.chat_session = None
+        self.chat_model = self.current_model()
         self.full_chat_markdown = ""
+        self.last_cost = None
 
         self.progress_bar.setValue(0)
         self.output_text_edit.clear()
@@ -1148,6 +1310,7 @@ class AudioSummaryApp(QWidget):
         self.processing_thread.error_occurred.connect(self.display_error)
         self.processing_thread.progress_update.connect(self.update_progress)
         self.processing_thread.status_update.connect(self.update_status)
+        self.processing_thread.cost_update.connect(self.add_cost)
         self.processing_thread.start()
         logging.info("Processing thread started.")
 
@@ -1188,13 +1351,17 @@ class AudioSummaryApp(QWidget):
         self.followup_button.setEnabled(False)
         self.progress_bar.setValue(0)
 
-        self.followup_thread = FollowUpThread(self.chat_session, follow_up_text)
+        self.last_cost = None
+        self.followup_thread = FollowUpThread(
+            self.chat_session, self.chat_model, follow_up_text
+        )
         self.followup_thread.followup_finished.connect(
             lambda text: self.display_followup(follow_up_text, text)
         )
         self.followup_thread.error_occurred.connect(self.display_followup_error)
         self.followup_thread.progress_update.connect(self.update_progress)
         self.followup_thread.status_update.connect(self.update_status)
+        self.followup_thread.cost_update.connect(self.add_cost)
         self.followup_thread.start()
 
     def display_followup(self, _user_text, result_text):

@@ -15,6 +15,7 @@ Programma GUI per trascrivere e riassumere file audio, come lezioni e messaggi v
 - Dopo una risposta di Gemini puoi continuare la conversazione con domande di follow-up.
 - Con Gemini puoi attivare la ricerca Google, utile per domande su eventi recenti.
 - Il modello di trascrizione di Gemini non supporta né la ricerca Google né il follow-up.
+- In basso a destra vedi quanto spendi: una stima per i file selezionati, il costo reale dell'ultima richiesta (calcolato dai token o dai secondi che l'API dichiara di aver fatturato) e il totale accumulato, che puoi azzerare. I prezzi sono quelli del paid tier: nel free tier di Gemini non paghi. Per i modelli Gemini la stima copre solo l'audio, perché la lunghezza della risposta non si sa in anticipo. Ogni follow-up rimanda a Gemini anche l'audio, quindi costa quanto una nuova richiesta.
 - I file caricati su Gemini restano disponibili per 48 ore, quindi rielaborare lo stesso file non lo ricarica.
 - L'interfaccia è semplice ed è fatta con PyQt6.
 - Tema scuro? Sì.
