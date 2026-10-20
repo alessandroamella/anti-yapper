@@ -1,96 +1,100 @@
 # Anti-Yapper 🗣️➡️📝
 
-Programma GUI per trascrivere e riassumere file audio. Così puoi avere lezioni o messaggi vocali trascritti (con OpenAI Whisper) e riassunti (con Google Gemini).
+Programma GUI per trascrivere e riassumere file audio, come lezioni e messaggi vocali. Per riassunti e analisi usa Google Gemini, per trascrizioni fedeli OpenAI `gpt-transcribe`.
 
 ![Anti-Yapper Screenshot](https://github.com/alessandroamella/riassunto-audio/raw/master/screenshot.png "Screenshot dell'app")
 
-## ✨ Caratteristiche
+## Caratteristiche
 
-- **Trascrizione Audio:** Converte l'audio parlato in testo usando OpenAI Whisper.
-- **Supporto Multi-File:** Elabora più file audio, unendoli per un riassunto unico o trascrivendo/riassumendo ogni file individualmente.
-- **Modalità Solo Trascrizione:** Ottieni solo la trascrizione, senza riassunto.
-- **Prompt Personalizzabile:** Definisci il tuo prompt per Gemini e personalizza lo stile del riassunto.
-- **GUI:** Interfaccia semplice creata con PyQt5.
-- **Tema Scuro:** Sì.
-- **Salvataggio Output:** Salvataggio automatico del riassunto (o trascrizione) in formato Markdown (`.md`).
-- **Formati Supportati:** Compatibile con OGG, WAV, MP3 e FLAC.
+- Un menu a tendina sceglie il modello: Gemini per analisi, riassunti e domande di follow-up, oppure OpenAI `gpt-transcribe` per una trascrizione fedele.
+- La trascrizione usa OpenAI `gpt-transcribe`. I file in formati non supportati o più grandi di 25 MB vengono convertiti e divisi automaticamente con `ffmpeg`.
+- Si possono elaborare più file insieme. Gemini li riceve tutti in un'unica richiesta; con OpenAI ogni file viene trascritto sotto un titolo con il suo nome.
+- Il prompt per Gemini è modificabile, quindi puoi decidere tu cosa fare con l'audio e lo stile del riassunto. Con OpenAI lo stesso campo serve per dare contesto alla trascrizione (argomento, nomi, termini tecnici).
+- Dopo una risposta di Gemini puoi continuare la conversazione con domande di follow-up.
+- Con Gemini puoi attivare la ricerca Google, utile per domande su eventi recenti.
+- I file caricati su Gemini restano disponibili per 48 ore, quindi rielaborare lo stesso file non lo ricarica.
+- L'interfaccia è semplice ed è fatta con PyQt6.
+- Tema scuro? Sì.
+- Il risultato viene salvato in Markdown (`.md`), e l'ultima risposta riappare al riavvio dell'app.
+- Formati supportati: OGG, WAV, MP3, FLAC, M4A, AAC e AIFF.
 
-## 🚀 Installazione
+## Installazione
 
 ### Prerequisiti
 
 - Python 3.x
-- Una Chiave API OpenAI (per la trascrizione)
-- Una Chiave API Google Gemini (per il riassunto)
+- Una chiave API OpenAI (per la trascrizione)
+- `ffmpeg` (per convertire e dividere l'audio da trascrivere con OpenAI)
+- Una chiave API Google Gemini (per il riassunto)
 
 ### Passaggi
 
-1.  **Clona il repository:**
+1.  Clona il repository:
 
     ```bash
     git clone https://github.com/alessandroamella/riassunto-audio.git
     cd riassunto-audio
     ```
 
-    _(Sostituisci `https://github.com/alessandroamella/riassunto-audio.git` con l'URL del tuo repository, se diverso)_
+    Se usi un fork, metti l'URL del tuo repository al posto di `https://github.com/alessandroamella/riassunto-audio.git`.
 
-2.  **Crea un ambiente virtuale (consigliato):**
+2.  Crea un ambiente virtuale (consigliato):
 
     ```bash
     python3 -m venv venv
     ```
 
-3.  **Attiva l'ambiente virtuale:**
+3.  Attiva l'ambiente virtuale.
 
-    - **Linux/macOS:**
-      ```bash
-      source venv/bin/activate
-      ```
-    - **Windows:**
-      ```bash
-      .\venv\Scripts\activate
-      ```
+    Su Linux/macOS:
 
-4.  **Installa le dipendenze:**
+    ```bash
+    source venv/bin/activate
+    ```
+
+    Su Windows:
+
+    ```bash
+    .\venv\Scripts\activate
+    ```
+
+4.  Installa le dipendenze:
 
     ```bash
     pip install -r requirements.txt
     ```
 
-5.  **Configura le Chiavi API:**
-    Crea un file `.env` nella directory principale del progetto (dove si trova `gui.py`) e aggiungi le tue chiavi API:
+5.  Configura le chiavi API. Crea un file `.env` nella cartella del progetto (quella con `gui.py`) e scrivici le tue chiavi:
 
     ```ini
     OPENAI_API_KEY="la_tua_chiave_api_openai_qui"
     GEMINI_API_KEY="la_tua_chiave_api_gemini_qui"
+    GEMINI_MODEL="gemini-3-flash-preview"
     ```
 
-    - Puoi ottenere una Chiave API OpenAI da [platform.openai.com](https://platform.openai.com/).
-    - Puoi ottenere una Chiave API Google Gemini da [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
+    La chiave OpenAI si ottiene da [platform.openai.com](https://platform.openai.com/), quella Gemini da [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey). `GEMINI_MODEL` è opzionale: se manca, l'app usa `gemini-3-flash-preview`.
 
-6.  **File Desktop (Opzionale):**
-    È incluso un file `anti-yapper.desktop` che puoi personalizzare e utilizzare per creare un collegamento sul desktop o nel menu delle applicazioni di Linux. Modifica il percorso nel file per puntare alla tua installazione.
-    - Copia il file nella directory `~/.local/share/applications/` per renderlo disponibile nel menu delle applicazioni.
+6.  File desktop (opzionale). Il repository include `anti-yapper.desktop`, che puoi usare come collegamento sul desktop o nel menu delle applicazioni di Linux. Modifica il percorso al suo interno in modo che punti alla tua installazione, poi copialo in `~/.local/share/applications/` per vederlo nel menu.
 
-## 💡 Utilizzo
+## Utilizzo
 
-1.  **Avvia l'applicazione:**
+1.  Avvia l'applicazione:
 
     ```bash
     python gui.py
     ```
 
-2.  **Seleziona i File Audio:**
-    Clicca su "Seleziona file audio" e scegli uno o più file (OGG, WAV, MP3, FLAC).
+2.  Clicca su "Seleziona file audio" e scegli uno o più file.
 
-3.  **Configura le Opzioni:**
+3.  Scegli il modello dal menu "Modello":
 
-    - **Unisci file audio:** Seleziona questa casella se hai più file e vuoi che vengano uniti per una trascrizione e un riassunto combinati. Altrimenti, ogni file sarà elaborato individualmente.
-    - **Esegui SOLO trascrizione:** Seleziona questa casella per ottenere solo la trascrizione. Il prompt di Gemini sarà disabilitato in questa modalità.
-    - **Prompt per Gemini (AI):** Modifica il testo per guidare Gemini nel riassunto. Il prompt predefinito è in italiano e ottimizzato per i messaggi vocali.
+    - Gemini, se vuoi un riassunto o un'analisi. Nel campo del prompt scrivi cosa fare con l'audio; quello predefinito chiede trascrizione e riassunto. Se serve, attiva la casella della ricerca Google.
+    - OpenAI `gpt-transcribe`, se vuoi solo la trascrizione. Il campo del prompt è opzionale e serve come contesto.
 
-4.  **Avvia l'Elaborazione:**
-    Clicca su "Riassumi!!". L'applicazione mostrerà una barra di progresso e visualizzerà trascrizione e riassunto.
+    L'app ricorda un prompt diverso per ciascun modello. "Reset Prompt" riporta quello del modello selezionato al valore predefinito.
 
-5.  **Salva l'Output:**
-    Al termine dell'elaborazione, apparirà una finestra di dialogo per salvare il riassunto (o la trascrizione in modalità solo trascrizione) come file Markdown.
+4.  Clicca su "Elabora!". Una barra di progresso mostra l'avanzamento, poi compare il risultato.
+
+5.  Alla fine si apre una finestra per salvare il risultato come file Markdown. Se la chiudi, puoi salvare dopo con Ctrl+S.
+
+6.  Con Gemini puoi scrivere altre domande nel campo "Continua la conversazione" e inviarle con "Invia continuo". Le risposte vengono aggiunte sotto il risultato.
