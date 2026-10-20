@@ -1,17 +1,20 @@
 # Anti-Yapper 🗣️➡️📝
 
-Programma GUI per trascrivere e riassumere file audio, come lezioni e messaggi vocali. Per riassunti e analisi usa Google Gemini, per trascrizioni fedeli OpenAI `gpt-transcribe`.
+Programma GUI per trascrivere e riassumere file audio, come lezioni e messaggi vocali. Per riassunti e analisi usa Google Gemini, per trascrizioni fedeli i modelli di trascrizione di OpenAI o Gemini.
 
 ![Anti-Yapper Screenshot](https://github.com/alessandroamella/riassunto-audio/raw/master/screenshot.png "Screenshot dell'app")
 
 ## Caratteristiche
 
-- Un menu a tendina sceglie il modello: Gemini per analisi, riassunti e domande di follow-up, oppure OpenAI `gpt-transcribe` per una trascrizione fedele.
-- La trascrizione usa OpenAI `gpt-transcribe`. I file in formati non supportati o più grandi di 25 MB vengono convertiti e divisi automaticamente con `ffmpeg`.
+- Un menu a tendina in alto sceglie il modello, e il pulsante "?" accanto mostra descrizione e prezzi di quello selezionato.
+  - Gemini: l'ultimo Flash, il modello dedicato alla trascrizione e i modelli Gemini 4. L'elenco viene aggiornato all'avvio con quelli disponibili per la tua chiave e salvato per l'avvio successivo. Se imposti `GEMINI_MODEL`, compare anche quello.
+  - OpenAI: `gpt-transcribe` (consigliato), `gpt-4o-transcribe-diarize` (separa chi parla, con etichette A, B, ...), `whisper-1`, `gpt-4o-transcribe` e `gpt-4o-mini-transcribe`.
+- Con OpenAI i file in formati non supportati o più grandi di 25 MB vengono convertiti e divisi automaticamente con `ffmpeg`. Per i modelli `gpt-4o-*` vengono divisi anche i file più lunghi di 20 minuti.
 - Si possono elaborare più file insieme. Gemini li riceve tutti in un'unica richiesta; con OpenAI ogni file viene trascritto sotto un titolo con il suo nome.
 - Il prompt per Gemini è modificabile, quindi puoi decidere tu cosa fare con l'audio e lo stile del riassunto. Con OpenAI lo stesso campo serve per dare contesto alla trascrizione (argomento, nomi, termini tecnici).
 - Dopo una risposta di Gemini puoi continuare la conversazione con domande di follow-up.
 - Con Gemini puoi attivare la ricerca Google, utile per domande su eventi recenti.
+- Il modello di trascrizione di Gemini non supporta né la ricerca Google né il follow-up.
 - I file caricati su Gemini restano disponibili per 48 ore, quindi rielaborare lo stesso file non lo ricarica.
 - L'interfaccia è semplice ed è fatta con PyQt6.
 - Tema scuro? Sì.
@@ -86,10 +89,10 @@ Programma GUI per trascrivere e riassumere file audio, come lezioni e messaggi v
 
 2.  Clicca su "Seleziona file audio" e scegli uno o più file.
 
-3.  Scegli il modello dal menu "Modello":
+3.  Scegli il modello dal menu in alto a destra (il pulsante "?" spiega ogni modello):
 
-    - Gemini, se vuoi un riassunto o un'analisi. Nel campo del prompt scrivi cosa fare con l'audio; quello predefinito chiede trascrizione e riassunto. Se serve, attiva la casella della ricerca Google.
-    - OpenAI `gpt-transcribe`, se vuoi solo la trascrizione. Il campo del prompt è opzionale e serve come contesto.
+    - Un modello Gemini, se vuoi un riassunto o un'analisi. Nel campo del prompt scrivi cosa fare con l'audio; quello predefinito chiede trascrizione e riassunto. Se serve, attiva la casella della ricerca Google.
+    - Un modello OpenAI, se vuoi solo la trascrizione. Il campo del prompt è opzionale e serve come contesto. `gpt-4o-transcribe-diarize` non accetta prompt.
 
     L'app ricorda un prompt diverso per ciascun modello. "Reset Prompt" riporta quello del modello selezionato al valore predefinito.
 

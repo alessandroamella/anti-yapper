@@ -3,8 +3,10 @@
 import base64
 import glob
 import hashlib
+import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,8 +16,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import OpenAI
-from PyQt6.QtCore import QSettings, QThread, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QKeySequence, QShortcut, QStandardItemModel
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -28,6 +30,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -39,11 +42,130 @@ logging.basicConfig(
 
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 
-OPENAI_TRANSCRIBE_MODEL = "gpt-transcribe"
 # Formats accepted by the OpenAI Transcriptions API; anything else is converted with ffmpeg
 OPENAI_SUPPORTED_EXTENSIONS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"}
 OPENAI_MAX_FILE_BYTES = 24 * 1024 * 1024  # API limit is 25 MB, keep a small margin
 OPENAI_CHUNK_SECONDS = 30 * 60  # ~7 MB per chunk at 32 kbps
+# gpt-4o-* transcription models reject audio longer than ~1400 s
+GPT4O_MAX_SECONDS = 20 * 60
+
+# Models from https://developers.openai.com/api/docs/guides/speech-to-text
+OPENAI_MODELS = {
+    "gpt-transcribe": {
+        "prompt": True,
+        "max_seconds": None,
+        "info": "Modello consigliato da OpenAI per trascrivere registrazioni nella "
+        "lingua originale. Il prompt fa da contesto (argomento, nomi, termini tecnici)."
+        "<br><br>Prezzo: $0.0045 al minuto (un'ora costa circa $0.27).",
+    },
+    "gpt-4o-transcribe-diarize": {
+        "prompt": False,
+        "diarize": True,
+        "max_seconds": GPT4O_MAX_SECONDS,
+        "info": "Riconosce chi parla ed etichetta ogni intervento (A, B, ...). "
+        "Da usare solo se servono gli speaker. Non accetta prompt. Se il file viene "
+        "diviso in parti, le etichette ripartono da capo in ogni parte."
+        "<br><br>Prezzo: circa $0.006 al minuto ($2.50 / 1M token in input, "
+        "$10 / 1M in output).",
+    },
+    "whisper-1": {
+        "prompt": True,
+        "max_seconds": None,
+        "info": "Il modello Whisper originale. Il prompt è limitato a 224 token e viene "
+        "seguito meno bene. Nell'API offre anche timestamp, sottotitoli e traduzione "
+        "in inglese, che questa app non usa.<br><br>Prezzo: $0.006 al minuto "
+        "(un'ora costa circa $0.36).",
+    },
+    "gpt-4o-transcribe": {
+        "prompt": True,
+        "max_seconds": GPT4O_MAX_SECONDS,
+        "info": "Trascrizione basata su GPT-4o. Supporta il prompt. OpenAI lo mantiene "
+        "per le integrazioni esistenti e consiglia gpt-transcribe per quelle nuove. "
+        "In una prova con un dialogo a due voci ha saltato alcune frasi."
+        "<br><br>Prezzo: circa $0.006 al minuto ($2.50 / 1M token in input, "
+        "$10 / 1M in output).",
+    },
+    "gpt-4o-mini-transcribe": {
+        "prompt": True,
+        "max_seconds": GPT4O_MAX_SECONDS,
+        "info": "Versione più economica di gpt-4o-transcribe. Supporta il prompt. "
+        "OpenAI lo mantiene per le integrazioni esistenti e consiglia gpt-transcribe "
+        "per quelle nuove. In una prova con un dialogo a due voci ha saltato alcune "
+        "frasi.<br><br>Prezzo: circa $0.003 al minuto ($1.25 / 1M token in input, "
+        "$5 / 1M in output).",
+    },
+}
+
+# Gemini models shown in the picker: the newest stable Flash, the newest dedicated
+# transcription model and every Gemini 4 model (plus GEMINI_MODEL from .env)
+GEMINI_FLASH_PATTERN = re.compile(r"^gemini-(\d+(?:\.\d+)?)-flash$")
+GEMINI_TRANSCRIBE_PATTERN = re.compile(r"^gemini-(\d+(?:\.\d+)?)-transcribe$")
+GEMINI_4_PATTERN = re.compile(r"^gemini-4(?:\.\d+)?-")
+# Gemini 4 variants that don't analyze audio into text
+GEMINI_EXCLUDED_KEYWORDS = ("tts", "image", "embedding", "live", "native-audio")
+
+GEMINI_PRICING_URL = "https://ai.google.dev/gemini-api/docs/pricing"
+# Descriptions and prices from https://ai.google.dev/gemini-api/docs/pricing
+# (paid tier, per 1M tokens); models missing here show the API metadata instead
+GEMINI_MODEL_INFO = {
+    "gemini-3.8-flash": "Il modello Flash più capace di Google. Va bene per "
+    "riassunti, analisi e domande sull'audio.<br><br>Prezzo: $0.75 in input e "
+    "$3.75 in output per 1M token fino al 31/12/2026, poi $1.50 e $7.50. "
+    "Gratis nel free tier.",
+    "gemini-3.5-transcribe": "Modello speech-to-text di Google: rileva la lingua "
+    "da solo e supporta la separazione degli speaker e un vocabolario "
+    "personalizzato. Non supporta la ricerca Google né le domande di follow-up."
+    "<br><br>Prezzo: circa $0.005 "
+    "al minuto ($0.003/min di audio in input più $0.002/min di testo in output). "
+    "Gratis nel free tier.",
+    "gemini-4-argon": "Il modello di punta di Google, pensato per ragionamenti "
+    "complessi, matematica e scienza. Non è disponibile nel free tier."
+    "<br><br>Prezzo: $2 in input e $10 in output per 1M token fino al 30/11/2026, "
+    "poi $4 e $20.",
+}
+
+
+def is_gemini_transcribe_model(model_id):
+    # Dedicated transcription models don't support Google Search or follow-up chats
+    return "-transcribe" in model_id
+
+
+def response_text(response):
+    """Return the text of a Gemini response, including audio transcription parts."""
+    if not response.candidates or not response.candidates[0].content:
+        return ""
+    texts = []
+    for part in response.candidates[0].content.parts or []:
+        if part.text and not part.thought:
+            texts.append(part.text)
+        elif part.audio_transcription and part.audio_transcription.text:
+            texts.append(part.audio_transcription.text)
+    return "".join(texts)
+
+
+def select_gemini_models(model_ids):
+    """Pick the Gemini models worth showing from all the ids the API returns."""
+
+    def newest(pattern):
+        matches = [(m, pattern.match(m)) for m in model_ids]
+        versions = [
+            (tuple(int(n) for n in match.group(1).split(".")), m)
+            for m, match in matches
+            if match
+        ]
+        return [max(versions)[1]] if versions else []
+
+    gemini_4 = sorted(
+        m
+        for m in model_ids
+        if GEMINI_4_PATTERN.match(m)
+        and not any(k in m for k in GEMINI_EXCLUDED_KEYWORDS)
+    )
+    return (
+        newest(GEMINI_FLASH_PATTERN)
+        + newest(GEMINI_TRANSCRIBE_PATTERN)
+        + gemini_4
+    )
 
 BACKEND_GEMINI = "gemini"
 BACKEND_OPENAI = "openai"
@@ -82,7 +204,7 @@ class FollowUpThread(QThread):
             response = self.chat_session.send_message(self.user_text)
             self.progress_update.emit(95)
             self.status_update.emit("Risposta ricevuta.")
-            self.followup_finished.emit(response.text)
+            self.followup_finished.emit(response_text(response))
             self.progress_update.emit(100)
             logging.info("FollowUpThread finished successfully.")
         except Exception as e:
@@ -257,12 +379,15 @@ class ProcessingThread(QThread):
             )
             # Esegui la chiamata a Gemini inviando primo messaggio col le clip
             response = chat_session.send_message(gemini_contents)
-            result_text = response.text
+            result_text = response_text(response)
 
             self.status_update.emit("Risposta ricevuta. Finalizzazione...")
             logging.info("Received response from Gemini.")
             self.progress_update.emit(95)
 
+            # The transcription reply can't be sent back as chat history
+            if is_gemini_transcribe_model(self.gemini_model):
+                chat_session = None
             self.processing_finished.emit(result_text, chat_session)
 
             self.progress_update.emit(100)
@@ -280,6 +405,81 @@ class ProcessingThread(QThread):
                 "Processing completed. All files preserved for future use (48h)."
             )
         logging.info("Processing thread run method completed.")
+
+
+class GeminiModelsThread(QThread):
+    """
+    Thread to fetch the list of Gemini models available to the API key.
+    """
+
+    models_loaded = pyqtSignal(list)
+
+    def __init__(self, gemini_api_key):
+        super().__init__()
+        self.gemini_api_key = gemini_api_key
+
+    def run(self):
+        logging.info("Fetching available Gemini models...")
+        try:
+            client = genai.Client(api_key=self.gemini_api_key)
+            available = {
+                model.name.removeprefix("models/"): model
+                for model in client.models.list()
+                if "generateContent" in (model.supported_actions or [])
+            }
+            models = []
+            for model_id in select_gemini_models(list(available)):
+                model = available[model_id]
+                models.append(
+                    {
+                        "id": model_id,
+                        "display_name": model.display_name,
+                        "description": model.description,
+                        "input_token_limit": model.input_token_limit,
+                        "output_token_limit": model.output_token_limit,
+                    }
+                )
+            logging.info(f"Gemini models: {[m['id'] for m in models]}")
+            self.models_loaded.emit(models)
+        except Exception as e:
+            # Keep using the cached list
+            logging.warning(f"Could not fetch Gemini models: {e}")
+
+
+def get_audio_duration(file_path):
+    """Return the duration of an audio file in seconds, or None if unknown."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                file_path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
+        logging.warning(f"Could not read duration of {file_path}: {e}")
+        return None
+
+
+def format_diarized_segments(segments):
+    """Join diarized segments into Markdown, merging consecutive turns of the same speaker."""
+    turns = []
+    for segment in segments:
+        text = segment.text.strip()
+        if turns and turns[-1][0] == segment.speaker:
+            turns[-1][1].append(text)
+        else:
+            turns.append((segment.speaker, [text]))
+    return "\n\n".join(f"**{speaker}:** {' '.join(texts)}" for speaker, texts in turns)
 
 
 def run_ffmpeg(args):
@@ -308,18 +508,26 @@ class TranscriptionThread(QThread):
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
 
-    def __init__(self, audio_file_paths, openai_api_key, context_prompt):
+    def __init__(self, audio_file_paths, openai_api_key, model, context_prompt):
         super().__init__()
         self.audio_file_paths = audio_file_paths
         self.openai_api_key = openai_api_key
+        self.model = model
+        self.model_options = OPENAI_MODELS[model]
         self.context_prompt = context_prompt
 
     def prepare_audio(self, file_path, index, work_dir):
         """Return the list of files to send to the API for this audio file."""
         ext = os.path.splitext(file_path)[1].lower()
+        max_seconds = self.model_options["max_seconds"]
+        too_long = False
+        if max_seconds:
+            duration = get_audio_duration(file_path)
+            too_long = duration is not None and duration > max_seconds
         if (
             ext in OPENAI_SUPPORTED_EXTENSIONS
             and os.path.getsize(file_path) <= OPENAI_MAX_FILE_BYTES
+            and not too_long
         ):
             return [file_path]
 
@@ -329,10 +537,10 @@ class TranscriptionThread(QThread):
         run_ffmpeg(
             ["-i", file_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", converted_path]
         )
-        if os.path.getsize(converted_path) <= OPENAI_MAX_FILE_BYTES:
+        if os.path.getsize(converted_path) <= OPENAI_MAX_FILE_BYTES and not too_long:
             return [converted_path]
 
-        logging.info(f"{converted_path} still too large, splitting into chunks...")
+        logging.info(f"{converted_path} too large or too long, splitting into chunks...")
         chunk_pattern = os.path.join(work_dir, f"file{index}_chunk%03d.mp3")
         run_ffmpeg(
             [
@@ -341,7 +549,7 @@ class TranscriptionThread(QThread):
                 "-f",
                 "segment",
                 "-segment_time",
-                str(OPENAI_CHUNK_SECONDS),
+                str(min(OPENAI_CHUNK_SECONDS, max_seconds or OPENAI_CHUNK_SECONDS)),
                 "-reset_timestamps",
                 "1",
                 "-c",
@@ -364,8 +572,11 @@ class TranscriptionThread(QThread):
             self.progress_update.emit(5)
 
             extra_args = {}
-            if self.context_prompt:
+            if self.context_prompt and self.model_options["prompt"]:
                 extra_args["prompt"] = self.context_prompt
+            if self.model_options.get("diarize"):
+                extra_args["response_format"] = "diarized_json"
+                extra_args["chunking_strategy"] = "auto"
 
             num_files = len(self.audio_file_paths)
             sections = []
@@ -386,14 +597,19 @@ class TranscriptionThread(QThread):
                             f"File {index + 1}/{num_files}: trascrizione di {file_name_for_error}"
                             f" (parte {chunk_index + 1}/{len(chunk_paths)})..."
                         )
-                        logging.info(f"Transcribing {chunk_path}...")
+                        logging.info(f"Transcribing {chunk_path} with {self.model}...")
                         with open(chunk_path, "rb") as audio_file:
                             transcription = client.audio.transcriptions.create(
-                                model=OPENAI_TRANSCRIBE_MODEL,
+                                model=self.model,
                                 file=audio_file,
                                 **extra_args,
                             )
-                        chunk_texts.append(transcription.text.strip())
+                        if self.model_options.get("diarize"):
+                            chunk_texts.append(
+                                format_diarized_segments(transcription.segments)
+                            )
+                        else:
+                            chunk_texts.append(transcription.text.strip())
 
                     text = "\n\n".join(chunk_texts)
                     if num_files > 1:
@@ -532,6 +748,16 @@ class AudioSummaryApp(QWidget):
                 background-color: #3a3a3a;
                 color: #666666;
             }
+            QToolButton {
+                background-color: #555555;
+                color: #ffffff;
+                border: 1px solid #666666;
+                padding: 4px 8px;
+                border-radius: 3px;
+            }
+            QToolButton:hover {
+                background-color: #666666;
+            }
             QComboBox QAbstractItemView {
                 background-color: #444444;
                 color: #ffffff;
@@ -575,23 +801,26 @@ class AudioSummaryApp(QWidget):
         self.file_path_label = QLabel("Nessun file audio selezionato", self)
         file_selection_layout.addWidget(self.file_path_label)
 
+        file_selection_layout.addStretch(1)
+
+        self.model_combo = QComboBox(self)
+        self.model_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.model_combo.setMaxVisibleItems(30)
+        file_selection_layout.addWidget(self.model_combo)
+
+        self.model_info_button = QToolButton(self)
+        self.model_info_button.setText("?")
+        self.model_info_button.setToolTip("Info sul modello selezionato")
+        self.model_info_button.clicked.connect(self.show_model_info)
+        file_selection_layout.addWidget(self.model_info_button)
+
         self.reset_button = QPushButton("Reset Prompt", self)
         self.reset_button.clicked.connect(self.reset_prompt)
         file_selection_layout.addWidget(self.reset_button)
 
         self.layout.addLayout(file_selection_layout)
-
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("Modello:", self))
-        self.model_combo = QComboBox(self)
-        self.model_combo.addItem(
-            f"Gemini ({self.gemini_model}) - analisi, riassunto, domande", BACKEND_GEMINI
-        )
-        self.model_combo.addItem(
-            f"OpenAI ({OPENAI_TRANSCRIBE_MODEL}) - trascrizione fedele", BACKEND_OPENAI
-        )
-        model_layout.addWidget(self.model_combo, 1)
-        self.layout.addLayout(model_layout)
 
         self.prompt_label = QLabel("", self)
         self.layout.addWidget(self.prompt_label)
@@ -657,13 +886,99 @@ class AudioSummaryApp(QWidget):
         logging.info("User interface initialized.")
 
     def current_backend(self):
-        return self.model_combo.currentData()
+        return self.model_combo.currentData().split(":", 1)[0]
+
+    def current_model(self):
+        return self.model_combo.currentData().split(":", 1)[1]
+
+    def populate_model_combo(self):
+        """Fill the model picker with Gemini and OpenAI models, keeping the selection."""
+        selected = self.settings.value(
+            "selectedModel", f"{BACKEND_GEMINI}:{self.gemini_model}"
+        )
+        gemini_models = list(self.gemini_models)
+        if not any(m["id"] == self.gemini_model for m in gemini_models):
+            gemini_models.insert(0, {"id": self.gemini_model})
+
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        combo_model = self.model_combo.model()
+        for header, backend, model_ids in (
+            ("Gemini", BACKEND_GEMINI, [m["id"] for m in gemini_models]),
+            ("OpenAI", BACKEND_OPENAI, list(OPENAI_MODELS)),
+        ):
+            if self.model_combo.count():
+                self.model_combo.insertSeparator(self.model_combo.count())
+            self.model_combo.addItem(header)
+            if isinstance(combo_model, QStandardItemModel):
+                # Section headers can't be selected
+                combo_model.item(self.model_combo.count() - 1).setEnabled(False)
+            for model_id in model_ids:
+                self.model_combo.addItem(model_id, f"{backend}:{model_id}")
+                self.model_combo.setItemData(
+                    self.model_combo.count() - 1,
+                    self.model_info_text(backend, model_id),
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+
+        index = self.model_combo.findData(selected)
+        if index < 0:
+            index = self.model_combo.findData(f"{BACKEND_GEMINI}:{self.gemini_model}")
+        self.model_combo.setCurrentIndex(index)
+        self.model_combo.blockSignals(False)
+
+    def model_info_text(self, backend, model_id):
+        if backend == BACKEND_OPENAI:
+            return f"<b>{model_id}</b> (OpenAI)<br><br>{OPENAI_MODELS[model_id]['info']}"
+
+        info = next((m for m in self.gemini_models if m["id"] == model_id), {})
+        text = f"<b>{info.get('display_name', model_id)}</b> ({model_id})"
+        if model_id in GEMINI_MODEL_INFO:
+            text += f"<br><br>{GEMINI_MODEL_INFO[model_id]}"
+        else:
+            if info.get("description") and info["description"] != info["display_name"]:
+                text += f"<br><br>{info['description']}"
+            text += (
+                f'<br><br>Prezzi: <a href="{GEMINI_PRICING_URL}">{GEMINI_PRICING_URL}</a>'
+            )
+        if info.get("input_token_limit"):
+            text += (
+                f"<br><br>Token in input: {info['input_token_limit']:,}"
+                f"<br>Token in output: {info['output_token_limit']:,}"
+            )
+        return text
+
+    def show_model_info(self):
+        QMessageBox.information(
+            self,
+            "Info modello",
+            self.model_info_text(self.current_backend(), self.current_model()),
+        )
+
+    def load_gemini_models(self):
+        """Show the cached Gemini models now and refresh the list in the background."""
+        try:
+            self.gemini_models = json.loads(self.settings.value("geminiModels", "[]"))
+        except json.JSONDecodeError:
+            self.gemini_models = []
+
+        if self.gemini_api_key:
+            self.gemini_models_thread = GeminiModelsThread(self.gemini_api_key)
+            self.gemini_models_thread.models_loaded.connect(self.on_gemini_models_loaded)
+            self.gemini_models_thread.start()
+
+    def on_gemini_models_loaded(self, models):
+        if models == self.gemini_models:
+            return
+        self.gemini_models = models
+        self.settings.setValue("geminiModels", json.dumps(models))
+        self.populate_model_combo()
+        self.apply_backend_ui()
 
     def load_settings(self):
         logging.info("Loading settings from QSettings.")
-        saved_backend = self.settings.value("selectedBackend", BACKEND_GEMINI)
-        backend_index = self.model_combo.findData(saved_backend)
-        self.model_combo.setCurrentIndex(max(backend_index, 0))
+        self.load_gemini_models()
+        self.populate_model_combo()
         self.apply_backend_ui()
         self.model_combo.currentIndexChanged.connect(self.on_model_changed)
         self.user_prompt_text_edit.textChanged.connect(self.save_settings)
@@ -690,11 +1005,26 @@ class AudioSummaryApp(QWidget):
             if self.current_backend() == BACKEND_OPENAI
             else ""
         )
-        self.search_checkbox.setEnabled(self.current_backend() == BACKEND_GEMINI)
+        if not self.prompt_supported():
+            self.prompt_label.setText(f"{self.current_model()} non accetta un prompt.")
+        self.user_prompt_text_edit.setEnabled(self.prompt_supported())
+        self.search_checkbox.setEnabled(self.search_supported())
+
+    def search_supported(self):
+        return (
+            self.current_backend() == BACKEND_GEMINI
+            and not is_gemini_transcribe_model(self.current_model())
+        )
+
+    def prompt_supported(self):
+        return (
+            self.current_backend() == BACKEND_GEMINI
+            or OPENAI_MODELS[self.current_model()]["prompt"]
+        )
 
     def on_model_changed(self):
-        logging.info(f"Selected backend: {self.current_backend()}")
-        self.settings.setValue("selectedBackend", self.current_backend())
+        logging.info(f"Selected model: {self.model_combo.currentData()}")
+        self.settings.setValue("selectedModel", self.model_combo.currentData())
         self.apply_backend_ui()
 
     def save_settings(self):
@@ -795,7 +1125,7 @@ class AudioSummaryApp(QWidget):
         user_prompt = self.user_prompt_text_edit.toPlainText()
 
         # Leggi lo stato della checkbox
-        use_google_search = self.search_checkbox.isChecked()
+        use_google_search = self.search_checkbox.isChecked() and self.search_supported()
 
         logging.info("Creating and starting processing thread.")
 
@@ -803,13 +1133,14 @@ class AudioSummaryApp(QWidget):
             self.processing_thread = TranscriptionThread(
                 self.audio_file_paths,
                 self.openai_api_key,
+                self.current_model(),
                 user_prompt.strip(),
             )
         else:
             self.processing_thread = ProcessingThread(
                 self.audio_file_paths,
                 self.gemini_api_key,
-                self.gemini_model,
+                self.current_model(),
                 user_prompt,
                 enable_search=use_google_search,
             )
@@ -831,9 +1162,9 @@ class AudioSummaryApp(QWidget):
 
         self.status_label.setText("Finito!!")
         self.process_button.setEnabled(True)
-        self.user_prompt_text_edit.setEnabled(True)
+        self.user_prompt_text_edit.setEnabled(self.prompt_supported())
         self.model_combo.setEnabled(True)
-        self.search_checkbox.setEnabled(self.current_backend() == BACKEND_GEMINI)
+        self.search_checkbox.setEnabled(self.search_supported())
 
         # Abilita box di followup (solo con Gemini, che ha una sessione chat)
         self.followup_input.setEnabled(chat_session is not None)
@@ -949,9 +1280,9 @@ class AudioSummaryApp(QWidget):
         file_name = os.path.basename(file_path)
         self.status_label.setText(f"Errore durante l'elaborazione di {file_name}.")
         self.process_button.setEnabled(True)
-        self.user_prompt_text_edit.setEnabled(True)
+        self.user_prompt_text_edit.setEnabled(self.prompt_supported())
         self.model_combo.setEnabled(True)
-        self.search_checkbox.setEnabled(self.current_backend() == BACKEND_GEMINI)
+        self.search_checkbox.setEnabled(self.search_supported())
         # Il follow up rimane disabilitato perche' la chat non e' pronta
         self.progress_bar.setValue(0)
         logging.error(f"Error displayed in UI for file: {file_name}")
