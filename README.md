@@ -13,6 +13,7 @@ Programma GUI per trascrivere e riassumere file audio, come lezioni e messaggi v
 - Si possono elaborare più file insieme. Gemini li riceve tutti in un'unica richiesta; con OpenAI ogni file viene trascritto sotto un titolo con il suo nome.
 - Il prompt per Gemini è modificabile, quindi puoi decidere tu cosa fare con l'audio e lo stile del riassunto. Con OpenAI lo stesso campo serve per dare contesto alla trascrizione (argomento, nomi, termini tecnici).
 - Dopo una risposta di Gemini puoi continuare la conversazione con domande di follow-up.
+- Le risposte compaiono mentre vengono generate, anche nei follow-up. Fa eccezione `whisper-1`, che non supporta lo streaming e mostra il testo solo alla fine.
 - Con Gemini puoi attivare la ricerca Google, utile per domande su eventi recenti.
 - Il modello di trascrizione di Gemini non supporta né la ricerca Google né il follow-up.
 - In basso a destra vedi quanto spendi: una stima per i file selezionati, il costo reale dell'ultima richiesta (calcolato dai token o dai secondi che l'API dichiara di aver fatturato) e il totale accumulato, che puoi azzerare. I prezzi sono quelli del paid tier: nel free tier di Gemini non paghi. Per i modelli Gemini la stima copre solo l'audio, perché la lunghezza della risposta non si sa in anticipo. Ogni follow-up rimanda a Gemini anche l'audio, quindi costa quanto una nuova richiesta.

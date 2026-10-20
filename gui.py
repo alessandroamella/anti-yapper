@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import OpenAI
-from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut, QStandardItemModel
 from PyQt6.QtWidgets import (
     QApplication,
@@ -55,6 +55,7 @@ OPENAI_MODELS = {
     "gpt-transcribe": {
         "prompt": True,
         "max_seconds": None,
+        "stream": True,
         "price": {"per_minute": 0.0045},
         "info": "Modello consigliato da OpenAI per trascrivere registrazioni nella "
         "lingua originale. Il prompt fa da contesto (argomento, nomi, termini tecnici)."
@@ -64,6 +65,7 @@ OPENAI_MODELS = {
         "prompt": False,
         "diarize": True,
         "max_seconds": GPT4O_MAX_SECONDS,
+        "stream": True,
         "price": {"input": 2.50, "output": 10.00, "per_minute": 0.006},
         "info": "Riconosce chi parla ed etichetta ogni intervento (A, B, ...). "
         "Da usare solo se servono gli speaker. Non accetta prompt. Se il file viene "
@@ -74,6 +76,7 @@ OPENAI_MODELS = {
     "whisper-1": {
         "prompt": True,
         "max_seconds": None,
+        "stream": False,
         "price": {"per_minute": 0.006},
         "info": "Il modello Whisper originale. Il prompt è limitato a 224 token e viene "
         "seguito meno bene. Nell'API offre anche timestamp, sottotitoli e traduzione "
@@ -83,6 +86,7 @@ OPENAI_MODELS = {
     "gpt-4o-transcribe": {
         "prompt": True,
         "max_seconds": GPT4O_MAX_SECONDS,
+        "stream": True,
         "price": {"input": 2.50, "output": 10.00, "per_minute": 0.006},
         "info": "Trascrizione basata su GPT-4o. Supporta il prompt. OpenAI lo mantiene "
         "per le integrazioni esistenti e consiglia gpt-transcribe per quelle nuove. "
@@ -93,6 +97,7 @@ OPENAI_MODELS = {
     "gpt-4o-mini-transcribe": {
         "prompt": True,
         "max_seconds": GPT4O_MAX_SECONDS,
+        "stream": True,
         "price": {"input": 1.25, "output": 5.00, "per_minute": 0.003},
         "info": "Versione più economica di gpt-4o-transcribe. Supporta il prompt. "
         "OpenAI lo mantiene per le integrazioni esistenti e consiglia gpt-transcribe "
@@ -160,7 +165,7 @@ def gemini_rates(model_id):
 def gemini_cost(model_id, response):
     """Return the cost in USD of a Gemini response, or None if unknown."""
     rates = gemini_rates(model_id)
-    usage = response.usage_metadata
+    usage = response.usage_metadata if response else None
     if not rates or not usage:
         return None
     prompt_tokens = usage.prompt_token_count or 0
@@ -206,6 +211,20 @@ def estimated_cost_per_minute(backend, model_id):
 def format_cost(cost):
     # Keep sub-cent amounts readable
     return f"${cost:.4f}" if 0 < cost < 0.01 else f"${cost:.2f}"
+
+
+def stream_gemini_message(chat_session, message, on_text):
+    """
+    Send a chat message with streaming, calling on_text with the text received so far.
+    Returns the full text and the last chunk, which carries the final token usage.
+    """
+    text = ""
+    last_chunk = None
+    for chunk in chat_session.send_message_stream(message):
+        text += response_text(chunk)
+        last_chunk = chunk
+        on_text(text)
+    return text, last_chunk
 
 
 def is_gemini_transcribe_model(model_id):
@@ -274,6 +293,7 @@ class FollowUpThread(QThread):
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
     cost_update = pyqtSignal(float)
+    partial_text = pyqtSignal(str)
 
     def __init__(self, chat_session, gemini_model, user_text):
         super().__init__()
@@ -286,14 +306,16 @@ class FollowUpThread(QThread):
         try:
             self.progress_update.emit(25)
             self.status_update.emit("Invio follow-up in corso...")
-            response = self.chat_session.send_message(self.user_text)
+            result_text, last_chunk = stream_gemini_message(
+                self.chat_session, self.user_text, self.partial_text.emit
+            )
             # The whole conversation, audio included, is sent again with each follow-up
-            cost = gemini_cost(self.gemini_model, response)
+            cost = gemini_cost(self.gemini_model, last_chunk)
             if cost is not None:
                 self.cost_update.emit(cost)
             self.progress_update.emit(95)
             self.status_update.emit("Risposta ricevuta.")
-            self.followup_finished.emit(response_text(response))
+            self.followup_finished.emit(result_text)
             self.progress_update.emit(100)
             logging.info("FollowUpThread finished successfully.")
         except Exception as e:
@@ -315,6 +337,7 @@ class ProcessingThread(QThread):
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
     cost_update = pyqtSignal(float)
+    partial_text = pyqtSignal(str)
 
     def __init__(
         self,
@@ -468,9 +491,10 @@ class ProcessingThread(QThread):
                 config=content_config,
             )
             # Esegui la chiamata a Gemini inviando primo messaggio col le clip
-            response = chat_session.send_message(gemini_contents)
-            result_text = response_text(response)
-            cost = gemini_cost(self.gemini_model, response)
+            result_text, last_chunk = stream_gemini_message(
+                chat_session, gemini_contents, self.partial_text.emit
+            )
+            cost = gemini_cost(self.gemini_model, last_chunk)
             if cost is not None:
                 self.cost_update.emit(cost)
 
@@ -601,6 +625,7 @@ class TranscriptionThread(QThread):
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
     cost_update = pyqtSignal(float)
+    partial_text = pyqtSignal(str)
 
     def __init__(self, audio_file_paths, openai_api_key, model, context_prompt):
         super().__init__()
@@ -653,6 +678,44 @@ class TranscriptionThread(QThread):
         )
         return sorted(glob.glob(os.path.join(work_dir, f"file{index}_chunk*.mp3")))
 
+    def transcribe_file(self, client, audio_path, extra_args, on_text):
+        """
+        Transcribe one file, streaming when the model supports it and calling on_text
+        with the text received so far. Returns the text and the billed usage.
+        """
+        diarize = self.model_options.get("diarize")
+        with open(audio_path, "rb") as audio_file:
+            if not self.model_options["stream"]:
+                transcription = client.audio.transcriptions.create(
+                    model=self.model, file=audio_file, **extra_args
+                )
+                if diarize:
+                    return (
+                        format_diarized_segments(transcription.segments),
+                        transcription.usage,
+                    )
+                return transcription.text.strip(), transcription.usage
+
+            stream = client.audio.transcriptions.create(
+                model=self.model, file=audio_file, stream=True, **extra_args
+            )
+            text = ""
+            segments = []
+            usage = None
+            for event in stream:
+                if event.type == "transcript.text.delta" and not diarize:
+                    text += event.delta
+                    on_text(text.strip())
+                elif event.type == "transcript.text.segment":
+                    segments.append(event)
+                    on_text(format_diarized_segments(segments))
+                elif event.type == "transcript.text.done":
+                    text = event.text
+                    usage = event.usage
+        if diarize:
+            return format_diarized_segments(segments), usage
+        return text.strip(), usage
+
     def run(self):
         logging.info("Transcription thread started.")
         file_name_for_error = "audio files"
@@ -686,6 +749,10 @@ class TranscriptionThread(QThread):
                     )
                     chunk_paths = self.prepare_audio(file_path, index, work_dir)
 
+                    def file_section(texts, name=file_name_for_error):
+                        text = "\n\n".join(texts)
+                        return f"## {name}\n\n{text}" if num_files > 1 else text
+
                     chunk_texts = []
                     for chunk_index, chunk_path in enumerate(chunk_paths):
                         self.status_update.emit(
@@ -693,26 +760,21 @@ class TranscriptionThread(QThread):
                             f" (parte {chunk_index + 1}/{len(chunk_paths)})..."
                         )
                         logging.info(f"Transcribing {chunk_path} with {self.model}...")
-                        with open(chunk_path, "rb") as audio_file:
-                            transcription = client.audio.transcriptions.create(
-                                model=self.model,
-                                file=audio_file,
-                                **extra_args,
-                            )
-                        total_cost += openai_cost(
-                            self.model, transcription.usage, chunk_path
+                        text, usage = self.transcribe_file(
+                            client,
+                            chunk_path,
+                            extra_args,
+                            lambda partial: self.partial_text.emit(
+                                "\n\n".join(
+                                    sections
+                                    + [file_section(chunk_texts + [partial])]
+                                )
+                            ),
                         )
-                        if self.model_options.get("diarize"):
-                            chunk_texts.append(
-                                format_diarized_segments(transcription.segments)
-                            )
-                        else:
-                            chunk_texts.append(transcription.text.strip())
+                        total_cost += openai_cost(self.model, usage, chunk_path)
+                        chunk_texts.append(text)
 
-                    text = "\n\n".join(chunk_texts)
-                    if num_files > 1:
-                        text = f"## {file_name_for_error}\n\n{text}"
-                    sections.append(text)
+                    sections.append(file_section(chunk_texts))
 
             self.status_update.emit("Trascrizione completata. Finalizzazione...")
             self.progress_update.emit(95)
@@ -768,6 +830,13 @@ class AudioSummaryApp(QWidget):
         self.chat_model = None
         self.full_chat_markdown = ""
         self.audio_durations = {}  # file path -> seconds, for cost estimates
+
+        # Streamed text is rendered at most a few times per second
+        self.pending_markdown = None
+        self.render_timer = QTimer(self)
+        self.render_timer.setSingleShot(True)
+        self.render_timer.setInterval(150)
+        self.render_timer.timeout.connect(self.render_pending_markdown)
         self.last_cost = None
 
         self.settings = QSettings("BitreyDev", "AudioSummaryApp")
@@ -1311,11 +1380,33 @@ class AudioSummaryApp(QWidget):
         self.processing_thread.progress_update.connect(self.update_progress)
         self.processing_thread.status_update.connect(self.update_status)
         self.processing_thread.cost_update.connect(self.add_cost)
+        self.processing_thread.partial_text.connect(self.show_partial_markdown)
         self.processing_thread.start()
         logging.info("Processing thread started.")
 
+    def show_partial_markdown(self, markdown):
+        self.pending_markdown = markdown
+        if not self.render_timer.isActive():
+            self.render_timer.start()
+
+    def render_pending_markdown(self):
+        if self.pending_markdown is None:
+            return
+        scroll_bar = self.output_text_edit.verticalScrollBar()
+        # Follow the new text only if the user hasn't scrolled up
+        at_bottom = scroll_bar.value() >= scroll_bar.maximum() - 20
+        self.output_text_edit.setHtml(mistune.html(self.pending_markdown))
+        self.pending_markdown = None
+        if at_bottom:
+            scroll_bar.setValue(scroll_bar.maximum())
+
+    def stop_partial_rendering(self):
+        self.render_timer.stop()
+        self.pending_markdown = None
+
     def display_result(self, result_text, chat_session):
         logging.info("Displaying processing result.")
+        self.stop_partial_rendering()
 
         self.chat_session = chat_session
         self.full_chat_markdown = result_text
@@ -1362,9 +1453,15 @@ class AudioSummaryApp(QWidget):
         self.followup_thread.progress_update.connect(self.update_progress)
         self.followup_thread.status_update.connect(self.update_status)
         self.followup_thread.cost_update.connect(self.add_cost)
+        self.followup_thread.partial_text.connect(
+            lambda text: self.show_partial_markdown(
+                f"{self.full_chat_markdown}\n\n---\n\n{text}"
+            )
+        )
         self.followup_thread.start()
 
     def display_followup(self, _user_text, result_text):
+        self.stop_partial_rendering()
         self.full_chat_markdown += f"\n\n---\n\n{result_text}"
 
         html_content = mistune.html(self.full_chat_markdown)
